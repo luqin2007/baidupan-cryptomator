@@ -22,10 +22,24 @@ import java.util.Set;
 public final class Reflectx {
 
     /** Absolute ceiling on nested object-graph walking, so a probe can never hang the app. */
-    private static final int HARD_MAX_DEPTH = 4;
-    private static final int HARD_MAX_NODES = 400;
+    private static final int HARD_MAX_DEPTH = 5;
+    private static final int HARD_MAX_NODES = 1200;
 
     private Reflectx() {
+    }
+
+    /**
+     * Only the app's own classes are worth walking.
+     *
+     * <p>A first version recursed into everything, which was useless: {@code MyNetdiskActivity}
+     * inherits from {@code android.app.Activity}, so ~200 of the ~400 lines it produced were
+     * framework internals (mHandler, mDecor, mWindowManager …) and the node budget ran out before
+     * the app's own fields were reached. Restricting the walk to {@code com.baidu.*} is what makes
+     * the graph readable.
+     */
+    static boolean isAppClass(Class<?> c) {
+        String n = c.getName();
+        return n.startsWith("com.baidu.") || n.startsWith("com.luqin.bdcrypto.");
     }
 
     // ------------------------------------------------------------- naming ---
@@ -231,6 +245,10 @@ public final class Reflectx {
             return;
         }
         for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            // Stop as soon as the chain leaves the app's own packages — see isAppClass().
+            if (!isAppClass(k)) {
+                break;
+            }
             Field[] fs;
             try {
                 fs = k.getDeclaredFields();
@@ -259,7 +277,7 @@ public final class Reflectx {
                     continue;
                 }
                 sb.append(head).append(" = ").append(preview(v)).append('\n');
-                if (level < maxDepth && interesting(v)) {
+                if (level < maxDepth && (isAppClass(v.getClass()) || interesting(v))) {
                     walk(v, level + 1, maxDepth, seen, budget, sb);
                 }
             }
@@ -275,10 +293,6 @@ public final class Reflectx {
     }
 
     private static boolean interesting(Object v) {
-        String n = v.getClass().getName();
-        if (n.startsWith("com.baidu.") || n.startsWith("com.luqin.bdcrypto.")) {
-            return true;
-        }
         return v instanceof Iterable || v instanceof java.util.Map;
     }
 

@@ -40,6 +40,10 @@ public final class Hooks {
     /** Cap on retained row samples; a vault listing is small but a scan of / could be large. */
     private static final int MAX_ROWS = 4000;
     private static final int MAX_URLS = 2000;
+    private static final int MAX_CHANNEL_LOGS = 400;
+
+    private static final java.util.concurrent.atomic.AtomicInteger channelLogs =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     private static volatile ClassLoader cl;
     private static volatile Context app;
@@ -52,6 +56,7 @@ public final class Hooks {
     private static final List<String> rows = Collections.synchronizedList(new ArrayList<String>());
     private static final Set<String> cursorColumns =
             Collections.synchronizedSet(new LinkedHashSet<String>());
+    private static final Set<String> cursorClasses = Collections.synchronizedSet(new HashSet<String>());
     private static final Set<String> adapterClasses =
             Collections.synchronizedSet(new LinkedHashSet<String>());
     private static final List<String> urls = Collections.synchronizedList(new ArrayList<String>());
@@ -125,6 +130,7 @@ public final class Hooks {
         hookCloudFileModel();
         hookCursorColumns();
         hookNetwork();
+        hookDownloadPipeline();
         Logx.i("app hooks installed in " + (System.currentTimeMillis() - t0) + " ms; "
                 + (missingTargets.size() - before) + " target(s) missing"
                 + (missingTargets.isEmpty() ? "" : " -> " + missingTargets));
@@ -240,10 +246,11 @@ public final class Hooks {
             XposedBridge.hookAllMethods(cf, "createFormCursor", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
+                    final MethodHookParam p = param;
                     safe("CloudFile.createFormCursor", new Body() {
                         @Override
                         public void run() {
-                            recordCloudFile(param.getResult(), "createFormCursor");
+                            recordRow(firstCursor(p.args), p.getResult(), "createFormCursor");
                         }
                     });
                 }
@@ -251,27 +258,59 @@ public final class Hooks {
             XposedBridge.hookAllMethods(cf, "readFromCursor", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
+                    final MethodHookParam p = param;
                     safe("CloudFile.readFromCursor", new Body() {
                         @Override
                         public void run() {
-                            Object[] a = param.args;
-                            if (a != null && a.length > 1) {
-                                recordCloudFile(a[1], "readFromCursor");
+                            Object[] a = p.args;
+                            if (a == null || a.length < 2) {
+                                return;
                             }
+                            recordRow(a[0], a[1], "readFromCursor");
                         }
                     });
                 }
             });
-            Logx.i("hooked CloudFile factories");
+            // A dlink appearing on a CloudFile is the single strongest signal that the app has
+            // just resolved "where to fetch this file from" — i.e. the content channel is opening.
+            XposedBridge.hookAllMethods(cf, "setDlink", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    final MethodHookParam p = param;
+                    safe("CloudFile.setDlink", new Body() {
+                        @Override
+                        public void run() {
+                            String url = p.args != null && p.args.length > 0
+                                    ? String.valueOf(p.args[0]) : null;
+                            if (url == null || "null".equals(url)) {
+                                return;
+                            }
+                            Logx.i("[dlink] fsId=" + Reflectx.callLong(p.thisObject, "getFileId", -1L)
+                                    + " name=" + Reflectx.callStr(p.thisObject, "getFileName")
+                                    + " url=" + shortUrl(url));
+                        }
+                    });
+                }
+            });
+            Logx.i("hooked CloudFile factories + setDlink");
         } catch (Throwable t) {
             note("hook CloudFile failed: " + t);
         }
     }
 
-    private static void recordCloudFile(Object o, String from) {
+    /** The Cursor is always the first argument of the CloudFile factories. */
+    private static Object firstCursor(Object[] args) {
+        if (args == null || args.length == 0) {
+            return null;
+        }
+        return args[0];
+    }
+
+    private static void recordRow(Object cursor, Object o, String from) {
         if (o == null || !o.getClass().getName().endsWith("CloudFile")) {
             return;
         }
+        rememberCursor(cursor);
         long fsId = Reflectx.callLong(o, "getFileId", -1L);
         String path = Reflectx.callStr(o, "getFilePath");
         String name = Reflectx.callStr(o, "getFileName");
@@ -281,10 +320,11 @@ public final class Hooks {
         }
         String line = "fsId=" + fsId
                 + " dir=" + Reflectx.callBool(o, "isDir", false)
+                + "/" + Reflectx.callBool(o, "isDirectory", false)
+                + " dirType=" + Reflectx.callLong(o, "getDirectoryType", -1L)
                 + " size=" + Reflectx.callLong(o, "getSize", -1L)
                 + " mtime=" + Reflectx.callLong(o, "getServerMTime", -1L)
                 + " md5=" + Reflectx.callStr(o, "getServerMD5")
-                + " dlink=" + shortUrl(Reflectx.callStr(o, "getFileDlink"))
                 + " name=" + name
                 + " path=" + path
                 + "  <-" + from;
@@ -294,12 +334,51 @@ public final class Hooks {
         Logx.i("[row] " + line);
     }
 
+    /**
+     * Learns the concrete Cursor class and its column names from the objects the app itself feeds
+     * into {@code CloudFile}.
+     *
+     * <p>Hooking {@code android.database.AbstractCursor.getColumnNames} does not work — it is an
+     * abstract method and LSPosed refuses (verified on device). The list's cursor is a custom
+     * class anyway, so the reliable route is to ask the cursor we are handed.
+     */
+    private static void rememberCursor(Object cursor) {
+        if (cursor == null) {
+            return;
+        }
+        String cls = cursor.getClass().getName();
+        if (cursorClasses.contains(cls)) {
+            return;
+        }
+        String cols = "<none>";
+        try {
+            java.lang.reflect.Method m = cursor.getClass()
+                    .getMethod("getColumnNames");
+            Object r = m.invoke(cursor);
+            if (r instanceof String[]) {
+                cols = Arrays.toString((String[]) r);
+            }
+        } catch (Throwable t) {
+            cols = "<" + t.getClass().getSimpleName() + ">";
+        }
+        if (cursorColumns.add(cls + " " + cols)) {
+            cursorClasses.add(cls);
+            Logx.i("[cursor] " + cls + " -> " + cols);
+        }
+    }
+
     // -------------------------------------------------------- Cursor -------
 
-    /** Column names of the list cursor: the raw truth about what the list query returns. */
+    /**
+     * Column names of DB-backed cursors, as a complement to {@link #rememberCursor}.
+     *
+     * <p>{@code android.database.AbstractCursor} is deliberately absent: its
+     * {@code getColumnNames} is abstract and LSPosed rejects the hook
+     * ("Cannot hook abstract methods"), which was observed on device. The list's own cursor is a
+     * custom class and is learned from {@code CloudFile} instead.
+     */
     private static void hookCursorColumns() {
         String[] targets = {
-                "android.database.AbstractCursor",
                 "android.database.CursorWrapper",
                 "android.database.MatrixCursor",
                 "android.database.sqlite.SQLiteCursor",
@@ -377,6 +456,102 @@ public final class Hooks {
                 || u.contains("file") || u.contains("list")) {
             Logx.i("[url] " + u);
         }
+    }
+
+    // -------------------------------------------------- download channel ----
+
+    /**
+     * The content channel, approached from the outside.
+     *
+     * <p>Everything between "the app decides to fetch file X" and "the bytes are on disk" is
+     * obfuscated ({@code _}, {@code __}, …), so instead of guessing which {@code __(String,
+     * ResultReceiver)} means what, hook <em>every</em> method and constructor of the few classes
+     * that own the pipeline and read the arguments off the wire. The method name is taken from
+     * {@code param.method}, so nothing here hard-codes an obfuscated identifier — which also means
+     * this survives an app update.
+     *
+     * <p>Capped: the transfer manager is chatty, and logcat is the only channel we have.
+     */
+    private static void hookDownloadPipeline() {
+        String[] classes = {
+                "com.baidu.netdisk.transfer.download.SingleFileDownloadHelper",
+                "com.baidu.netdisk.transfer.download.SingleFileDownloadHelper$DownloadResultReceiver",
+                "com.baidu.netdisk.transfer.task.DownloadTaskManager",
+        };
+        for (String name : classes) {
+            Class<?> c = XposedHelpers.findClassIfExists(name, cl);
+            if (c == null) {
+                note("missing target: " + name);
+                continue;
+            }
+            try {
+                XposedBridge.hookAllMethods(c, null, CHANNEL);
+                XposedBridge.hookAllConstructors(c, CHANNEL);
+                Logx.i("hooked download channel: " + name);
+            } catch (Throwable t) {
+                note("hook " + name + " failed: " + t);
+            }
+        }
+    }
+
+    private static final XC_MethodHook CHANNEL = new XC_MethodHook() {
+        @Override
+        protected void afterHookedMethod(MethodHookParam param) {
+            final MethodHookParam p = param;
+            safe("download channel", new Body() {
+                @Override
+                public void run() {
+                    logChannel(p);
+                }
+            });
+        }
+    };
+
+    private static void logChannel(XC_MethodHook.MethodHookParam p) {
+        if (channelLogs.incrementAndGet() > MAX_CHANNEL_LOGS) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder("[dl] ");
+        if (p.method != null) {
+            sb.append(p.method.getDeclaringClass().getName()).append('.').append(p.method.getName());
+        } else {
+            sb.append("?");
+        }
+        sb.append('(').append(briefArgs(p.args)).append(')');
+        if (p.hasThrowable()) {
+            sb.append(" !! ").append(p.getThrowable());
+        } else if (p.getResult() != null) {
+            sb.append(" -> ").append(brief(p.getResult()));
+        }
+        Logx.i(sb.toString());
+    }
+
+    private static String briefArgs(Object[] args) {
+        if (args == null || args.length == 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(brief(args[i]));
+        }
+        return sb.toString();
+    }
+
+    private static String brief(Object o) {
+        if (o == null) {
+            return "null";
+        }
+        if (o instanceof CharSequence) {
+            String s = o.toString();
+            return '"' + (s.length() > 200 ? s.substring(0, 200) + "…" : s) + '"';
+        }
+        if (o instanceof Number || o instanceof Boolean || o instanceof Character) {
+            return o.toString();
+        }
+        return o.getClass().getName();
     }
 
     // -------------------------------------------------------- accessors ----
