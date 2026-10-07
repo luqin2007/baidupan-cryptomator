@@ -29,7 +29,21 @@ public final class XposedBridge {
         throw new UnsupportedOperationException("stub");
     }
 
-    public static void hookMethod(java.lang.reflect.Member method, XC_MethodHook callback) {
+    /**
+     * Return type must match the live framework exactly. Verified against the
+     * framework dex shipped by LSPosed 2.1.1 (7790) on the test device:
+     *
+     * <pre>
+     *   de.robv.android.xposed.XC_MethodHook$Unhook
+     *       de.robv.android.xposed.XposedBridge.hookMethod(java.lang.reflect.Member,
+     *                                                      de.robv.android.xposed.XC_MethodHook)
+     * </pre>
+     *
+     * A stub that declared {@code void} would make d8 emit a method reference whose
+     * prototype does not exist at runtime, i.e. NoSuchMethodError on first use.
+     */
+    public static XC_MethodHook.Unhook hookMethod(java.lang.reflect.Member method, XC_MethodHook callback) {
+        return null;
     }
 
     public static Object invokeOriginalMethod(java.lang.reflect.Member method, Object thisObject, Object[] args)

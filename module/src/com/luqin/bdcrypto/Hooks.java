@@ -63,6 +63,25 @@ public final class Hooks {
     private static final Set<String> urlSeen = Collections.synchronizedSet(new HashSet<String>());
     private static final List<String> missingTargets = Collections.synchronizedList(new ArrayList<String>());
 
+    /**
+     * Vault recognition, built purely from the listing we are already given.
+     *
+     * <p>A directory is a Cryptomator vault when its own listing contains both
+     * {@code vault.cryptomator} and {@code masterkey.cryptomator}. Each marker is remembered
+     * separately so the order in which the two rows arrive does not matter — the listing is
+     * delivered row by row, in whatever order the cursor happens to yield.
+     */
+    private static final Set<String> dirsWithVaultFile =
+            Collections.synchronizedSet(new HashSet<String>());
+    private static final Set<String> dirsWithMasterkeyFile =
+            Collections.synchronizedSet(new HashSet<String>());
+    private static final Set<String> vaultsAnnounced =
+            Collections.synchronizedSet(new HashSet<String>());
+
+    /** So the toolbar dump is produced once per process, not once per vault. */
+    private static final java.util.concurrent.atomic.AtomicBoolean toolbarDumped =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
     private Hooks() {
     }
 
@@ -186,6 +205,11 @@ public final class Hooks {
             Report.write(app, "graph-" + where + ".txt", g);
         }
         Logx.i("[fragment.graph " + where + "] " + truncate(g, 1800));
+        if ("onResume".equals(where) && !vaultsAnnounced.isEmpty()) {
+            // The vault may have been recognised while no fragment was on screen; the toolbar only
+            // exists now, so this is the second chance to measure it.
+            dumpToolbarTree("resume, vaults=" + vaultsAnnounced);
+        }
     }
 
     // ---------------------------------------------------- recycler list ----
@@ -315,6 +339,9 @@ public final class Hooks {
         String path = Reflectx.callStr(o, "getFilePath");
         String name = Reflectx.callStr(o, "getFileName");
         String key = fsId + "|" + path + "|" + name;
+        // Before the de-duplication guard: a directory is usually revisited many times, and the
+        // vault test has to run on every pass, not only the first one.
+        detectVault(path, name);
         if (!rowsSeen.add(key)) {
             return;
         }
@@ -466,17 +493,26 @@ public final class Hooks {
      * <p>Everything between "the app decides to fetch file X" and "the bytes are on disk" is
      * obfuscated ({@code _}, {@code __}, …), so instead of guessing which {@code __(String,
      * ResultReceiver)} means what, hook <em>every</em> method and constructor of the few classes
-     * that own the pipeline and read the arguments off the wire. The method name is taken from
+     * that own the pipeline and read the arguments off the wire. The name is taken from
      * {@code param.method}, so nothing here hard-codes an obfuscated identifier — which also means
      * this survives an app update.
      *
-     * <p>Capped: the transfer manager is chatty, and logcat is the only channel we have.
+     * <p>There is no "hook every method of this class" helper: {@code hookAllMethods} takes a
+     * method <em>name</em> and LSPosed rejects a null one outright
+     * ({@code NullPointerException: methodName cannot be null} — observed on device, 16:33).
+     * So each member is enumerated and passed to {@code hookMethod(Member, …)} individually, and
+     * failures are counted per member rather than aborting the whole class. Abstract and native
+     * members are skipped up front because the framework cannot hook them.
      */
     private static void hookDownloadPipeline() {
         String[] classes = {
                 "com.baidu.netdisk.transfer.download.SingleFileDownloadHelper",
                 "com.baidu.netdisk.transfer.download.SingleFileDownloadHelper$DownloadResultReceiver",
                 "com.baidu.netdisk.transfer.task.DownloadTaskManager",
+                "com.baidu.netdisk.file.download.component.apis.FDDownloadManagerApi",
+                "com.baidu.netdisk.cloudp2p.component.provider.CloudP2pDlinkApi",
+                "com.baidu.netdisk.transfer.transmitter.locate.LocateDownloadUrls",
+                "com.baidu.netdisk.transfer.io.model.LocateDownloadResponse",
         };
         for (String name : classes) {
             Class<?> c = XposedHelpers.findClassIfExists(name, cl);
@@ -484,13 +520,35 @@ public final class Hooks {
                 note("missing target: " + name);
                 continue;
             }
-            try {
-                XposedBridge.hookAllMethods(c, null, CHANNEL);
-                XposedBridge.hookAllConstructors(c, CHANNEL);
-                Logx.i("hooked download channel: " + name);
-            } catch (Throwable t) {
-                note("hook " + name + " failed: " + t);
+            int hooked = 0;
+            int skipped = 0;
+            for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                int mod = m.getModifiers();
+                if (java.lang.reflect.Modifier.isAbstract(mod)
+                        || java.lang.reflect.Modifier.isNative(mod)) {
+                    skipped++;
+                    continue;
+                }
+                try {
+                    XposedBridge.hookMethod(m, CHANNEL);
+                    hooked++;
+                } catch (Throwable t) {
+                    skipped++;
+                }
             }
+            for (java.lang.reflect.Constructor<?> k : c.getDeclaredConstructors()) {
+                try {
+                    XposedBridge.hookMethod(k, CHANNEL);
+                    hooked++;
+                } catch (Throwable t) {
+                    skipped++;
+                }
+            }
+            if (hooked == 0) {
+                note("no member hooked on " + name);
+            }
+            Logx.i("hooked download channel: " + name
+                    + " (" + hooked + " members, " + skipped + " skipped)");
         }
     }
 
@@ -554,6 +612,175 @@ public final class Hooks {
         return o.getClass().getName();
     }
 
+    // ----------------------------------------------------------- vault -----
+
+    /**
+     * Turns "the listing contains these two file names" into "this directory is a vault".
+     *
+     * <p>Costs nothing: it reads data the app already produced. The only side effects are one log
+     * line, one toast, and (once per process) a dump of the toolbar's real view tree.
+     */
+    private static void detectVault(String path, String name) {
+        if (path == null || name == null) {
+            return;
+        }
+        String dir;
+        int slash = path.lastIndexOf('/');
+        if (slash <= 0) {
+            dir = "/";
+        } else {
+            dir = path.substring(0, slash);
+        }
+
+        boolean first;
+        if ("vault.cryptomator".equals(name)) {
+            first = dirsWithVaultFile.add(dir);
+        } else if ("masterkey.cryptomator".equals(name)) {
+            first = dirsWithMasterkeyFile.add(dir);
+        } else {
+            return;
+        }
+        if (!first) {
+            return;
+        }
+        if (!dirsWithVaultFile.contains(dir) || !dirsWithMasterkeyFile.contains(dir)) {
+            return;
+        }
+        if (!vaultsAnnounced.add(dir)) {
+            return;
+        }
+
+        Logx.i("[vault] Cryptomator vault detected at " + dir);
+        toast("BdCryptomator：检测到 Cryptomator 保险库\n" + dir);
+        dumpToolbarTree("vault at " + dir);
+    }
+
+    /** A visible acknowledgement that the whole detect path ran, on the app's own UI. */
+    private static void toast(final String msg) {
+        final Context c = app;
+        if (c == null) {
+            return;
+        }
+        try {
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        android.widget.Toast.makeText(c, msg, android.widget.Toast.LENGTH_LONG).show();
+                    } catch (Throwable t) {
+                        Logx.w("toast failed: " + t);
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            Logx.w("toast cannot be posted: " + t);
+        }
+    }
+
+    /**
+     * Prints the real view tree around {@code id/filter} as the app built it.
+     *
+     * <p>The static UI dump is not enough to place a button: it reports the accessibility tree, and
+     * for this toolbar the reported parent ({@code LinearLayout id=container}) holds children whose
+     * bounds do not stack the way a single LinearLayout would. The View tree — with each container's
+     * class, orientation, child count, and the index and LayoutParams of the filter icon — is the
+     * only thing that decides whether a sibling can be inserted safely.
+     */
+    private static void dumpToolbarTree(String why) {
+        if (!toolbarDumped.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Object f = lastFragment;
+            if (f == null) {
+                Logx.w("[toolbar] no fragment yet; will retry on next resume");
+                toolbarDumped.set(false);
+                return;
+            }
+            Object rv = Reflectx.call0(f, "getView");
+            if (!(rv instanceof android.view.View)) {
+                Logx.w("[toolbar] fragment view not available");
+                toolbarDumped.set(false);
+                return;
+            }
+            android.view.View root = (android.view.View) rv;
+            int id = app == null ? -1 : app.getResources().getIdentifier("filter", "id", APP_PKG);
+            if (id == -1) {
+                Logx.w("[toolbar] R.id.filter not resolvable");
+                return;
+            }
+            android.view.View v = root.findViewById(id);
+            if (v == null) {
+                Logx.w("[toolbar] id/filter not under the fragment view");
+                toolbarDumped.set(false);
+                return;
+            }
+
+            StringBuilder sb = new StringBuilder("[toolbar] view chain of id/filter (")
+                    .append(why).append(")\n");
+            android.view.View cur = v;
+            for (int i = 0; cur != null && i < 8; i++) {
+                android.view.ViewGroup.LayoutParams lp = cur.getLayoutParams();
+                sb.append("  [").append(i).append("] ").append(cur.getClass().getName())
+                        .append(" id=").append(idName(cur))
+                        .append(" lp=").append(lp == null ? "null"
+                                : lp.getClass().getSimpleName() + "(" + lp.width + "x" + lp.height + ")")
+                        .append(" xy=").append((int) cur.getX()).append(',').append((int) cur.getY())
+                        .append(" wh=").append(cur.getWidth()).append('x').append(cur.getHeight())
+                        .append(" vis=").append(cur.getVisibility())
+                        .append('\n');
+                android.view.ViewParent p = cur.getParent();
+                if (p instanceof android.view.ViewGroup) {
+                    android.view.ViewGroup g = (android.view.ViewGroup) p;
+                    sb.append("      parent=").append(g.getClass().getName())
+                            .append(" id=").append(idName(g))
+                            .append(" children=").append(g.getChildCount())
+                            .append(" myIndex=").append(g.indexOfChild(cur));
+                    if (g instanceof android.widget.LinearLayout) {
+                        sb.append(" orientation=")
+                                .append(((android.widget.LinearLayout) g).getOrientation());
+                    }
+                    if (g instanceof android.view.View) {
+                        android.view.View gv = (android.view.View) g;
+                        sb.append(" wh=").append(gv.getWidth()).append('x').append(gv.getHeight());
+                        sb.append(" vis=").append(gv.getVisibility());
+                    }
+                    sb.append('\n');
+                    for (int k = 0; k < g.getChildCount(); k++) {
+                        android.view.View ck = g.getChildAt(k);
+                        android.view.ViewGroup.LayoutParams klp = ck.getLayoutParams();
+                        sb.append("        ").append(k).append(": ")
+                                .append(ck.getClass().getSimpleName())
+                                .append(" id=").append(idName(ck))
+                                .append(" lp=").append(klp == null ? "null"
+                                        : klp.getClass().getSimpleName()
+                                                + "(" + klp.width + "x" + klp.height + ")")
+                                .append('\n');
+                    }
+                }
+                cur = (p instanceof android.view.View) ? (android.view.View) p : null;
+            }
+            Logx.i(sb.toString());
+        } catch (Throwable t) {
+            Logx.w("[toolbar] dump failed: " + t);
+        }
+    }
+
+    private static String idName(android.view.View v) {
+        try {
+            int i = v.getId();
+            if (i == android.view.View.NO_ID) {
+                return "-";
+            }
+            if (app != null) {
+                return app.getResources().getResourceEntryName(i);
+            }
+            return String.valueOf(i);
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
     // -------------------------------------------------------- accessors ----
 
     public static String graphOfLastFragment() {
@@ -605,6 +832,7 @@ public final class Hooks {
                 + "\n  rows        : " + rows.size()
                 + "\n  cursor sets : " + cursorColumns.size()
                 + "\n  urls        : " + urls.size()
+                + "\n  vaults      : " + vaultsAnnounced
                 + "\n  missing     : " + missingTargets;
     }
 

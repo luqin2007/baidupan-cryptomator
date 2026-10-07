@@ -43,7 +43,7 @@ Cryptomator 的 Android 官方客户端需要把整个保险库通过 WebDAV / �
 | Root 方案 | KernelSU + Zygisk Next + LSPosed（`lspd`、`zn-zygisk-companion64 zygisk_lsposed` 均在跑） |
 | 目标 App | 百度网盘 `com.baidu.drive.app` **13.11.13**（targetSdk 35，包根 `com.baidu.netdisk.*`） |
 | 构建 | 手工 `javac` + `d8` + `aapt2` + `apksigner`，**不依赖 Gradle / 不联网** |
-| 观测通道 | `adb logcat`（无 root）；⚠️ `adb shell` 下 `su` 不可用 |
+| 观测通道 | ⚠️ **只有 `lspd` 的文件日志可靠**：`/data/adb/lspd/log/modules_<ISO>.log`（需 root）。`logcat` 的主环只有 128 KiB，App 启动一次就把它冲掉 |
 
 > 设备上还装有另一个针对同一 App 的第三方模块（`com.xiyunmn.puredupan.hook`）。
 > 两者可以共存，但如果日后出现难解释的表现，优先怀疑它。
@@ -163,10 +163,20 @@ LSPosed → 模块 → 网盘 Cryptomator → 作用域 → 勾选「百度网�
 ```bash
 adb shell am force-stop com.baidu.drive.app
 adb shell am start -n com.baidu.drive.app/com.baidu.netdisk.ui.DefaultMainActivity
-adb logcat -s BDCrypto:V
+```
+
+看日志请读 **`lspd` 的文件日志**，不是 logcat：
+
+```bash
+adb shell su -c 'ls -t /data/adb/lspd/log/modules_*.log | head -1'   # 最新一份
 ```
 
 看到 `=== BdCryptomator attached: pkg=com.baidu.drive.app ... ===` 就说明模块活了。
+
+> **不要用 `logcat -s BDCrypto:V` 判断模块是否加载。** 实测 `main` 环形缓冲只有 128 KiB，
+> 网盘启动一次就把它冲干净，之后只会看到空结果 —— 这会得出"模块挂了"的错误结论
+> （我就是这么误判过一次，详见 `docs/recon.md` §8.1）。
+> `logcat` 只适合启动后几秒内的即时观察。
 
 ### 7.1 校验下载的 APK
 

@@ -204,3 +204,109 @@ shade 情况：
 3. **内容读取通道** —— 在混淆的下载管线里，哪一条反射调用能"给定云端路径 → 拿到字节"。
 
 模块内置的探针正是为回答这三个问题而写的。
+
+---
+
+## 8. 真机跑起来之后推翻的三个判断（2026-10-07 晚）
+
+第一次真机运行把三条"推论"改成了"实测"，其中两条是我自己写错的。
+
+### 8.1 观测通道：logcat 不可靠，模块日志要看 `lspd`
+
+M0 期间我在 16:25–16:32 用 `adb logcat -s BDCrypto:V` 判定"框架不再注入模块"，
+据此提出"需要重启设备"。**这个结论是错的。** 事后从设备上读到：
+
+```
+BdCryptomator attached 的次数：12
+16:19:37 / 16:19:42 / 16:21:09 / 16:21:12 / 16:24:39 / 16:24:43
+16:25:05 / 16:25:09 / 16:25:44 / 16:25:48 / 16:33:44 / 16:33:47
+```
+
+我"判定已死"的那几分钟里，模块**每一次都在正常注入**。原因是观测手段：
+
+```
+main: ring buffer is 128 KiB ... 当前可读行数 = 54
+```
+
+网盘启动一次就会把 128 KiB 的 logcat 主环冲掉，随后在 `-d` 里什么也看不见。
+而 LSPosed 的模块日志真正落在 `/data/adb/lspd/log/modules_<ISO>.log`
+（本次是 `modules_2026-10-07T10:53:31.831644.log`）。
+
+> **结论：诊断本模块只有一条可靠通道 —— `lspd` 的文件日志，需要 root 读取。**
+> `logcat` 只能用于"启动后几秒内"的即时观察。
+
+### 8.2 工具栏不是 `top_bar_layout`，是列表的一个 header item
+
+`id/sort`（智能排序）与 `id/filter`（筛选）的**父容器是 `LinearLayout id=container`，
+而 `container` 又挂在 `RecyclerView id=list_recycler_view` 下** —— 也就是说这一行是
+列表的 header，由 `FileListToolBarHeaderView` 渲染（它内部那个 `$_` 是个
+`RecyclerView.Adapter`，正好对上）。
+
+`top_bar_layout` 里只有 `tv_my_wangpan` 与 `rv_breadcrumb`。
+
+右侧空间已近饱和（`filter` 右边界 955、`switch_layout_icon` 右边界 1036、屏宽 1080），
+**盲插一个同宽按钮（86px）会把 `switch_layout_icon` 挤出屏幕**。
+所以插入位置必须等运行时视图树确认，不能照静态 dump 下手。
+
+### 8.3 `hookAllMethods(cls, null, cb)` 不存在
+
+P0 的下载通道 hook 全部失败：
+
+```
+[target] hook ...SingleFileDownloadHelper failed:
+         java.lang.NullPointerException: methodName cannot be null
+```
+
+Xposed 没有"hook 该类全部方法"的 API；`hookAllMethods` 收的是**方法名**，LSPosed 对 null 直接抛。
+正确做法是枚举 `getDeclaredMethods()` / `getDeclaredConstructors()` 逐个 `hookMethod(Member, cb)`。
+
+### 8.4 顺带修正：stub 的返回类型必须与框架一致
+
+`XposedBridge.hookMethod` 的真实签名（直接读设备上的
+`/data/adb/modules/zygisk_lsposed/framework.dex` 得到，LSPosed v2.1.1 / 7790）：
+
+```
+java.util.Set            hookAllMethods(Class, String, XC_MethodHook)
+java.util.Set            hookAllConstructors(Class, XC_MethodHook)
+XC_MethodHook$Unhook     hookMethod(Member, XC_MethodHook)
+void                     log(String)
+```
+
+我原先的 stub 把 `hookMethod` 写成 `void` —— 那样 d8 会生成一个**运行时不存在的方法原型**，
+首次调用即 `NoSuchMethodError`。已修正，并在构建产物里逐条比对过方法引用。
+
+### 8.5 列表 Cursor 的真实形态
+
+`CloudFile` 工厂的入参 Cursor 类名被混淆（`hm.____`），列名完整可读：
+
+```
+_id, fid, server_path, file_name, isdir, state, file_category, file_property,
+parent_path, blocklist, file_md5, s3_handle, file_size, server_ctime, server_mtime,
+client_ctime, client_mtime, file_download_state, ...
+```
+
+行内实测可取到 `fsId / path / name / mtime / md5`（含中文名），
+这正是后续要透传回原密文所需的那组身份字段。
+
+### 8.6 下载管线的活体签名
+
+```
+SingleFileDownloadHelper
+    __(String, ResultReceiver)          ____(String)          ___(String) : String
+
+DownloadTaskManager  (继承 IDownloadable 相关)
+    f(IDownloadable, IDownloadProcessorFactory, TaskResultReceiver, int)
+    d(List, IDownloadProcessorFactory, TaskResultReceiver, int)
+    e(List, IDownloadProcessorFactory, TaskResultReceiver, int, ITaskStateCallback)
+
+FDDownloadManagerApi      (51 个方法，Kotlin 编译产物)
+    l(IDownloadable, IDownloadProcessorFactory, TaskResultReceiver, int)
+
+CloudP2pDlinkApi
+    getDlinkByTaskId(int, String, String)
+    getShareDownloadDlink(String, String, long[], String, ...) : ArrayList
+```
+
+`IDownloadable` 的方法名是干净的（`getFileDlink` / `getFilePath` / `getFileId`），
+且 `CloudFile` 实现了它 —— 所以"给定一个 CloudFile，让 App 自己去下载"这条路有明确入口。
+P0-B 的判断留给下一版的运行时调用图。
