@@ -702,4 +702,35 @@ App 弹出：
   这类参数要带 `MSYS_NO_PATHCONV=1`。反过来，`javac`/`aapt2` 这类原生 exe 又**必须**给
   `C:/…` 形式（`cygpath -m`）。
 
+### 11.7 解封步骤（下次开工从这里接）
+
+设备上装的是 `0.10.0-p0b`（versionCode 14），`Channel.install` 已在**两个进程**成功装上：
+`DownloadTaskManager (44)` / `FDDownloadManagerApi (52)` / `SingleFileDownloadHelper (5)` /
+`ExternalDownloadHelper (10)` / `TaskResultReceiver (8)`。捕获层是好的，缺的只是"让它看见一次真的下载"。
+
+1. **先在 App 里点「允许」**授予存储权限。这一步必须由人来做，模块不会去代点。
+2. `/crypto/content` → 多选 `vault.cryptomator` → 底部栏「下载」。
+   注意别点行右侧的「更多」：那会落到行本身、进多选模式（曾经这样误触过一次）。
+   真正的下载会解出一颗小文件，成本可忽略。
+3. 验证重放通道：
+   ```bash
+   ./probe.sh ch last     # 应出现 [ch#new]，记下 manager/factory/receiver 是否已持有
+   ./probe.sh ch files    # 列表里被 hold 住的 CloudFile
+   ./probe.sh ch go 0     # 用借来的 factory/receiver 重放一次
+   ```
+   `[ch#new]` 一条都没有 = 观察这一步没发生，此时**不要**去看重放（重放依赖观察的结果）。
+4. **P0-B 的完成标准（Task #9）**：把 `vault.cryptomator` 整个读出来，与
+   `D:\cryptomator\baidu\vault.cryptomator` **逐字节比对**。期望值不用猜，直接由 oracle 给出：
+   ```bash
+   bash tools/oracle/oracle.sh unlock /d/cryptomator/baidu 'f_EqfhYmWxAMq!!dmL_3'
+   ```
+   （口令已由 `oracle.sh check` 的 `versionMac` 逐字节确认。）
+
+### 11.8 下一阶段开工前要先补的一件事
+
+当前保险库太稀疏（**1 个目录、1 个文件**，即 `重要.rtf` 820 B），
+P2 要验的**中文名 / 超长名 / 多级目录 / >32 KiB 多 chunk** 一个都覆盖不到 ——
+这属于 P0-D「造一个内容更丰富的测试保险库」。**先补保险库，再写 P2**，
+否则 P2 的"与桌面版逐条对照"没有对照物。
+
 
