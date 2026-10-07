@@ -541,3 +541,165 @@ A/B/D 三步验证 §9.5 的清扫：进目录、退到非保险库目录，
 P1 到此为止：按钮的出现、消失、不重复、位置、点击回调全部有实测支撑。
 下一步是 P0-B 内容读取通道（读 `vault.cryptomator` 全文），见 §7 的剩余目标。
 
+## 11. P0-B 内容读取通道（2026-10-08 凌晨，运行时 `dump` 探针）
+
+§7 的第 3 问："在混淆的下载管线里，哪一条反射调用能'给定云端路径 → 拿到字节'"。
+这一节记录已经**实测到**的部分，以及为什么这条路不能靠"自己造参数"走通。
+
+### 11.1 两个否定的结论，先排除掉两条看似好走的路
+
+| 本来以为可以 | 实测 |
+|---|---|
+| 浏览时 `CloudFile.setDlink` 会被调用，拿到 URL 就能自己 GET | **0 次调用**。dlink 只在真的下载/预览时才解析，光浏览不产生 |
+| hook `okhttp3.Request$Builder.build` 观察所有出站 URL | 钩子**装上了**（日志 5 次 `hooked okhttp3.Request$Builder.build`），但 `[url]` **0 条** —— App 的 HTTP 流量根本不走 okhttp。这条观测路是死的 |
+
+`okhttp3.OkHttpClient` / `Request$Builder` 都能解析到（`selftest` 19/19），但它们不是 App 的业务网络栈。
+
+### 11.2 运行时真实签名（`dump` 探针，非反编译推测）
+
+`FDDownloadManagerApi`（51 个成员，`public` 无参构造）：
+
+```
+l(IDownloadable, IDownloadProcessorFactory, TaskResultReceiver, int)          <- 单文件
+e(List, IDownloadProcessorFactory, TaskResultReceiver, int)
+g(Activity, boolean, List, IDownloadProcessorFactory, ResultReceiver, int)
+______(Activity, boolean, List, IDownloadProcessorFactory, ResultReceiver, int, ITaskStateCallback)
+q(List, int, OnProcessListener, Processor$OnAddTaskListener) : IDownloadProcessorFactory
+t(String, long, Processor$OnAddTaskListener, int) : IDownloadProcessorFactory
+u(IFileInfoGenerator, ITaskGenerator, OnProcessListener) : IDownloadProcessorFactory
+r(long, long, long, int, int, int) : IFileInfoGenerator
+s(long, long, long, int, int) : ITaskGenerator
+v(String, String, String, long, int, int, boolean, String, int) : IFileInfoGenerator
+w(List, String, String, String, int) : ITaskGenerator
+x() : int    y() : int    z() : String    C()/D() : boolean
+```
+
+`DownloadTaskManager`（构造 `(String token, String uid)`，43 个成员）：
+
+```
+f(IDownloadable, IDownloadProcessorFactory, TaskResultReceiver, int)          <- 单文件，与上面的 l 同形
+d(List, IDownloadProcessorFactory, TaskResultReceiver, int)
+e(List, IDownloadProcessorFactory, TaskResultReceiver, int, ITaskStateCallback)
+v(List, IDownloadProcessorFactory, TaskResultReceiver, int, ITaskStateCallback)
+g(List, IDownloadProcessorFactory, int)
+k(IDownloadable, String) : String        o(String, String) : String
+```
+
+`SingleFileDownloadHelper`：构造 `(String)`；`__(String, ResultReceiver)`、
+`___(String) : String`、`____(String)`。
+
+`ExternalDownloadHelper`（"导出到其他应用"用的单文件下载助手）：
+`__(String, long, String)`、`___(String, long, String, Processor$OnAddTaskListener, int)`、
+`____(Context, String, long, Uri) : boolean`、`a(Context,String,String)`、
+`b(Activity,String,String,String)`、`c(Context,String,String)`。
+
+**反例修正**：`LocateDownloadUrls` 名字像"定位下载地址的网络调用"，实际是个
+**`Parcelable` 数据容器**（字段 `host` / `rank` / `url`，方法只有
+`describeContents`/`toString`/`writeToParcel`）。§4 把它列为 dlink 候选路径是错的。
+
+### 11.3 为什么不能自己造参数：`Processor` 是抽象类
+
+`IDownloadProcessorFactory` **只有一个方法**：
+
+```
+Processor _(IDownloadable, boolean, String, String, int, String)
+```
+
+看着很小，可以代理 —— 但它**返回 `com.baidu.netdisk.transfer.base.Processor`，而那是个
+抽象类**（`public Processor()` + 一个抽象方法 `_()`）。
+
+- `java.lang.reflect.Proxy` **只能代理接口**，覆盖不了类；
+- 运行时造子类需要自己生成字节码，代价远超收益。
+
+`TaskResultReceiver` 同理不能凭空造：它 `extends WeakRefResultReceiver extends android.os.ResultReceiver`，
+全部意义在于被我们并不拥有的机制回调。（它的构造是 `public TaskResultReceiver(Object, Handler)`，
+所以能 new，但那只是把回调指向别处，仍然不会产生字节。）
+
+**结论：这些对象要"借"，不能"造"。** 真实下载发生时 App 会自己产出 factory / receiver /
+manager 实例，模块留住它们、之后用它们发起自己的下载。这正是 `Channel` 的设计：
+**观察一次，之后重放**。
+
+为此 `Channel` 与本模块原有的 `hookDownloadPipeline` 有两点刻意不同：
+
+1. 旧钩子把原始调用按 `MAX_CHANNEL_LOGS = 400` 截断，而 App 在真正下载前会先打几百条无关的
+   `[dl]`（构造、`i() -> 0`、`m() -> false`），**恰恰把有用的那条挤掉**。新钩子按
+   **签名**（声明类 + 方法名 + 参数类型）去重，签名首次出现即记录，量就压不住它。
+2. 旧钩子只渲染参数；新钩子还**保留** `IDownloadProcessorFactory` / `TaskResultReceiver` /
+   `CloudFile` / `Activity` 的活引用。保留本身就是目的。
+
+### 11.4 保险库 oracle（离线，已逐字节验证）
+
+密码 **`f_EqfhYmWxAMq!!dmL_3` 确认正确** —— 不是靠"能解开"这种间接证据，而是手工重做
+scrypt + 两次 AES-KW 解包 + 校验 `versionMac`，逐字节吻合：
+
+```
+versionMac = HMAC-SHA256(hmacMasterKey, version 的 4 字节大端)   # version = 999
+```
+
+顺带确认的 spec 细节（`D:/cryptomator/baidu`，format 8 / SIV_GCM / shorteningThreshold 220）：
+
+| 项 | 值 |
+|---|---|
+| scrypt | salt 8 B，cost 32768，blockSize 8，dkLen 32 |
+| `primaryMasterKey` / `hmacMasterKey` | 各 AES-KW 包裹 40 B → 明文 32 B |
+| **pepper** | **必须是空数组**（见下） |
+| 明文根 `/` 的密文位置 | **`d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7`**，不是 `d/` |
+| 明文文件 | 只有 1 个：`重要.rtf`，820 B，sha256 `141d1df78e8bb95ce053bbbae0d030be7f4a4aaadda250bc938cdc659c2dc5ac` |
+| 它的密文 | `d/SY/RGEQ…/kymd3lVEAXDmA07lgpuoDiebhu6fvHpvkCQ=.c9r`，916 B |
+| `dirid.c9r` | 96 B，**没有明文对应物**（是目录自身的标记） |
+
+云端 `/crypto/content` 的列表与本机目录**逐项尺寸吻合**，所以这个本机副本就是设备上那个保险库的
+等价物，可以直接当比对基准。
+
+⚠️ **保险库几乎是空的**（1 目录 1 文件）。P2 要验证中文名 / 超长名 / 多级目录 / >32 KiB
+多 chunk，这个保险库**覆盖不到**，需要先补内容（原 P0-D）。
+
+#### 陷阱：`MasterkeyFileAccess` 的第一个参数是 pepper，不是版本号
+
+```
+MasterkeyFileAccess(byte[] pepper, SecureRandom)   // 字段名就叫 pepper
+scrypt(CharSequence passphrase, byte[] scryptSalt, byte[] pepper, int cost, int blockSize)
+```
+
+传非空数组会改变 KEK，于是 AES-KW 解包失败，**抛出 `InvalidPassphraseException` —— 与
+"密码真的错了" 完全无法区分**，且没有任何参数错误的提示。这一条白白吃掉了一小时
+（我先后传了 `vault.cryptomator` 的内容、`masterkey.cryptomator` 的内容）。
+`readAllegedVaultVersion(byte[])` 是**无关的**静态helper，它读的是*masterkey 文件自己*的
+`version` 字段。
+
+配套的两个 cryptofs 用法陷阱：
+
+- `CryptoFileSystemProvider.newFileSystem` 要的是**保险库根目录**，不是 `d/`
+  （它自己去读 `<vault>/vault.cryptomator`，再下到 `<vault>/d`）。
+- 明文根是 `fs.getPath("/")`，**不是 `fs.getPathToVault()`** —— 后者回答的是"保险库存在哪"，
+  返回的是**默认文件系统**上的路径，walk 它会 walk 到原始密文目录。
+
+复现工具已入库：`tools/oracle/`（`oracle.sh check|unlock`），
+`tools/oracle/README.md` 记了这两个陷阱。
+
+### 11.5 阻塞点：下载需要存储权限
+
+真实触发一次下载（`/crypto/content` → 多选 `vault.cryptomator` → 底部栏「下载」）时，
+App 弹出：
+
+```
+申请存储权限
+用于提供文件传输功能，允许权限后您可以正常使用。
+[允许]  [不允许]
+```
+
+**未授权之前不会发生任何下载**，`[ch#new]` 一条都不会有 —— 也就借不到 factory/receiver，
+重放无法进行。是否授予该权限由用户决定。
+
+### 11.6 操作事实（这一轮踩到的）
+
+- **探针只在 App 处于前台时有效。** 进程还活着（`pidof` 有值）但已被 Android 16 冻结时，
+  广播收不到、什么都不记录。症状是"探针突然没反应"，`am start` 拉回前台即恢复。
+- **`adb shell` 会把 `$` 当变量展开**：`--es cls 'a.b.C$D'` 到了设备侧变成 `a.b.C`，
+  于是 `dump Processor$OnAddTaskListener` 静默地 dump 了 `Processor`。值里的 `$` 要写成 `\$`。
+- **MSYS 路径改写在 P0-B 里有一半是反的**：Git Bash 下 `/sdcard/ui.xml` 会被改写成 Windows 路径，
+  于是 `uiautomator dump` 写到了本地一个不存在的目录、`adb shell cat` 什么都读不到。
+  这类参数要带 `MSYS_NO_PATHCONV=1`。反过来，`javac`/`aapt2` 这类原生 exe 又**必须**给
+  `C:/…` 形式（`cygpath -m`）。
+
+

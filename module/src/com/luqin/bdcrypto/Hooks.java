@@ -194,6 +194,9 @@ public final class Hooks {
         hookCursorColumns();
         hookNetwork();
         hookDownloadPipeline();
+        // P0-B. The pipeline hook above only renders arguments; this one keeps them, which is what
+        // makes a replay possible at all (see Channel for why the objects cannot be built).
+        Channel.install(cl);
         Logx.i("app hooks installed in " + (System.currentTimeMillis() - t0) + " ms; "
                 + (missingTargets.size() - before) + " target(s) missing"
                 + (missingTargets.isEmpty() ? "" : " -> " + missingTargets));
@@ -429,6 +432,7 @@ public final class Hooks {
             return;
         }
         rememberCursor(cursor);
+        Channel.noteFile(o);
         long fsId = Reflectx.callLong(o, "getFileId", -1L);
         String path = Reflectx.callStr(o, "getFilePath");
         String name = Reflectx.callStr(o, "getFileName");

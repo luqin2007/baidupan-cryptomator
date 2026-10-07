@@ -85,6 +85,8 @@ public final class Probe {
             Logx.i(Hooks.buttonCommand(arg));
         } else if ("copies".equals(cmd)) {
             Logx.i(Hooks.copiesReport("probe"));
+        } else if ("ch".equals(cmd)) {
+            Logx.i(Channel.command(arg));
         } else {
             Logx.w("unknown cmd: " + cmd);
             help();
@@ -107,6 +109,10 @@ public final class Probe {
                 + "                              is in its toolbar, and the colour/alpha of each child\n"
                 + "  btn [args]                inject / style / remove the unlock button\n"
                 + "                              off | diag | text=<label> | w=<px> | size=<sp>\n"
+                + "  ch [arg]                  content channel (P0-B)\n"
+                + "                              last   - what was captured, and every distinct call\n"
+                + "                              files  - CloudFiles held from the list, for a replay\n"
+                + "                              go <n|name> [flag] - download one of them for real\n"
                 + "  state                     one-line summary of what has been captured\n"
                 + "  ls | clear                list / delete probe report files");
     }

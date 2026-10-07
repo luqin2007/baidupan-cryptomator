@@ -36,3 +36,6 @@ Thumbs.db
 
 # Agent workspace metadata (local paths, session notes) - not project source.
 .workbuddy/
+
+# Oracle tool scratch output (compiled classes)
+tools/oracle/.build/
