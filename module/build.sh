@@ -161,6 +161,18 @@ echo "==> [5/8] linking resources + manifest + assets"
     --version-name "$VERSION_NAME" \
     "$BUILD/res.zip"
 
+# aapt2 applies --version-code/--version-name only when the manifest does not already declare
+# them. When it does, the flag is dropped without a warning and the APK quietly ships under an
+# old version — which is exactly what happened here (three builds, all claiming 0.1.0-p0). Read
+# the linked artefact back instead of trusting the flag.
+LINKED_BADGING="$("$AAPT2" dump badging "$BUILD/base.apk" 2>/dev/null | head -1)"
+LINKED_CODE="$(printf '%s' "$LINKED_BADGING" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
+LINKED_NAME="$(printf '%s' "$LINKED_BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")"
+if [ "$LINKED_CODE" != "$VERSION_CODE" ] || [ "$LINKED_NAME" != "$VERSION_NAME" ]; then
+    die "manifest version mismatch: build asked for $VERSION_NAME ($VERSION_CODE) but the linked APK carries $LINKED_NAME ($LINKED_CODE). Check AndroidManifest.xml for hard-coded versionCode/versionName."
+fi
+echo "    manifest version: $LINKED_NAME ($LINKED_CODE)"
+
 echo "==> [6/8] packaging dex + aligning"
 "$PY" - "$BUILD/base.apk" "$BUILD/dex" "$BUILD/unsigned.apk" <<'PYEOF'
 import glob, os, shutil, sys, zipfile

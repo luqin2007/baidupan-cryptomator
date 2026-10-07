@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.luqin.bdcrypto"
-    android:versionCode="1"
-    android:versionName="0.1.0-p0">
+    package="com.luqin.bdcrypto">
+
+    <!-- versionCode / versionName are deliberately absent (no double hyphen allowed in a comment,
+         hence the phrasing). aapt2 applies its version flags only "if none is present" in the
+         manifest, so hard-coding them here silently wins over whatever build.sh passes: three
+         different builds all shipped as versionCode 1 / versionName 0.1.0-p0 while the release
+         page said otherwise. The version now has exactly one source, build.sh, which also asserts
+         that the linked APK really carries it. -->
 
     <uses-sdk
         android:minSdkVersion="24"
