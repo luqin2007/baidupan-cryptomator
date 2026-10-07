@@ -78,6 +78,21 @@ public final class Hooks {
     private static final Set<String> vaultsAnnounced =
             Collections.synchronizedSet(new HashSet<String>());
 
+    /**
+     * Directories proven to be vaults, and therefore directories the unlock button belongs in.
+     *
+     * <p>Separate from {@link #vaultsAnnounced}, which exists only to keep the log and the toast
+     * honest at one per directory. The listing is re-delivered every time a directory is opened,
+     * while the fragment view — and with it the button — is destroyed and rebuilt on every
+     * navigation. So "is this a vault" has to be answerable without any per-directory first-time
+     * bookkeeping, or the button appears once per process and never again.
+     */
+    private static final Set<String> vaultDirs =
+            Collections.synchronizedSet(new HashSet<String>());
+
+    /** The injected unlock button, or null. Held so it can be removed without searching the tree. */
+    private static volatile android.view.View unlockButton;
+
     /** So the toolbar dump is produced once per process, not once per vault. */
     private static final java.util.concurrent.atomic.AtomicBoolean toolbarDumped =
             new java.util.concurrent.atomic.AtomicBoolean();
@@ -194,6 +209,12 @@ public final class Hooks {
     }
 
     private static void onFragmentEvent(String where, Object fragment) {
+        if ("onDestroyView".equals(where)) {
+            // The view tree (and the injected button with it) is thrown away here. Dropping the
+            // reference is what allows the next listing to inject a fresh one — keeping it would
+            // leave a detached view that "already exists" for ever.
+            unlockButton = null;
+        }
         lastFragment = fragment;
         lastFragmentWhere = where + "@" + android.os.SystemClock.uptimeMillis();
         Logx.i("[fragment] " + where + " -> " + Reflectx.typeOf(fragment));
@@ -624,12 +645,13 @@ public final class Hooks {
         if (path == null || name == null) {
             return;
         }
-        String dir;
-        int slash = path.lastIndexOf('/');
-        if (slash <= 0) {
-            dir = "/";
-        } else {
-            dir = path.substring(0, slash);
+        String dir = dirOf(path);
+
+        // Fast path: this directory is already known to be a vault, so the listing now arriving is
+        // the app re-opening it. The view was rebuilt, so the button has to be put back.
+        if (vaultDirs.contains(dir)) {
+            ensureUnlockButton(dir);
+            return;
         }
 
         boolean first;
@@ -646,13 +668,35 @@ public final class Hooks {
         if (!dirsWithVaultFile.contains(dir) || !dirsWithMasterkeyFile.contains(dir)) {
             return;
         }
-        if (!vaultsAnnounced.add(dir)) {
+
+        vaultDirs.add(dir);
+        if (vaultsAnnounced.add(dir)) {
+            Logx.i("[vault] Cryptomator vault detected at " + dir);
+            toast("BdCryptomator：检测到 Cryptomator 保险库\n" + dir);
+            dumpToolbarTree("vault at " + dir);
+        }
+        ensureUnlockButton(dir);
+    }
+
+    /** The directory a path lives in, treating a shallower path as root. */
+    private static String dirOf(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash <= 0 ? "/" : path.substring(0, slash);
+    }
+
+    /**
+     * Puts the unlock button into the toolbar, if it is not already there.
+     *
+     * <p>Called from the row path, which runs on the app's loader thread, so the actual view
+     * surgery is posted to the main thread and this returns immediately — a listing must never wait
+     * on us.
+     */
+    private static void ensureUnlockButton(String dir) {
+        android.view.View b = unlockButton;
+        if (b != null && b.getParent() != null) {
             return;
         }
-
-        Logx.i("[vault] Cryptomator vault detected at " + dir);
-        toast("BdCryptomator：检测到 Cryptomator 保险库\n" + dir);
-        dumpToolbarTree("vault at " + dir);
+        injectUnlockButton(null, null, null, "vault at " + dir, false);
     }
 
     /** A visible acknowledgement that the whole detect path ran, on the app's own UI. */
@@ -677,6 +721,275 @@ public final class Hooks {
         }
     }
 
+    // ----------------------------------------------------------- button ----
+
+    private static final String BUTTON_LABEL = "解锁";
+
+    /**
+     * {@code btn} probe command: {@code off} removes the button, anything else (re)injects it.
+     *
+     * <p>Optional overrides, comma separated: {@code w=<px>} (width), {@code size=<sp>} (text size),
+     * {@code text=<label>}. They exist because the button's geometry has to be judged against the
+     * real toolbar, and a module reinstall is far too slow a feedback loop for that.
+     */
+    public static String buttonCommand(String arg) {
+        String a = arg == null ? "" : arg.replace(" ", "");
+        if ("off".equalsIgnoreCase(a) || "rm".equalsIgnoreCase(a) || "0".equals(a)) {
+            String r = detachUnlockButton("probe");
+            Logx.i("[button] " + r);
+            return r;
+        }
+        Integer w = null;
+        Integer size = null;
+        String label = null;
+        for (String kv : a.split(",")) {
+            if (kv.isEmpty()) {
+                continue;
+            }
+            int eq = kv.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            String k = kv.substring(0, eq);
+            String v = kv.substring(eq + 1);
+            try {
+                if ("w".equals(k)) {
+                    w = Integer.valueOf(v);
+                } else if ("size".equals(k)) {
+                    size = Integer.valueOf(v);
+                } else if ("text".equals(k)) {
+                    label = v;
+                }
+            } catch (Throwable ignored) {
+                // a malformed override must not fail the whole command
+            }
+        }
+        String r = injectUnlockButton(label, w, size, "probe", true);
+        Logx.i("[button] " + (r == null ? "posted, no result captured" : r));
+        return r;
+    }
+
+    /**
+     * @return the outcome, or null when {@code await} is false (the caller is the row path and must
+     *     not block). Never throws.
+     */
+    private static String injectUnlockButton(final String label, final Integer widthPx,
+                                             final Integer sizeSp, final String why,
+                                             final boolean await) {
+        if (app == null) {
+            Logx.w("[button] no app context yet (" + why + ")");
+            return null;
+        }
+        final String[] result = new String[1];
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        try {
+            boolean posted =
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                result[0] = attachUnlockButton(label, widthPx, sizeSp, why);
+                            } catch (Throwable t) {
+                                result[0] = "attach threw: " + t + " (" + why + ")";
+                            } finally {
+                                done.countDown();
+                            }
+                        }
+                    });
+            if (!posted) {
+                Logx.w("[button] main thread rejected the post (" + why + ")");
+                return null;
+            }
+        } catch (Throwable t) {
+            Logx.w("[button] cannot reach the main thread: " + t);
+            return null;
+        }
+        if (!await) {
+            return null;
+        }
+        try {
+            done.await(4, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Throwable ignored) {
+            // the caller still gets whatever was produced
+        }
+        return result[0];
+    }
+
+    private static String detachUnlockButton(final String why) {
+        final android.view.View b = unlockButton;
+        if (b == null) {
+            return "no unlock button was injected (" + why + ")";
+        }
+        final String[] out = new String[1];
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        try {
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        android.view.ViewParent p = b.getParent();
+                        if (p instanceof android.view.ViewGroup) {
+                            ((android.view.ViewGroup) p).removeView(b);
+                            out[0] = "unlock button removed from " + p.getClass().getName()
+                                    + " (" + why + ")";
+                        } else {
+                            out[0] = "unlock button had no parent (" + why + ")";
+                        }
+                    } catch (Throwable t) {
+                        out[0] = "remove failed: " + t + " (" + why + ")";
+                    } finally {
+                        unlockButton = null;
+                        done.countDown();
+                    }
+                }
+            });
+            done.await(4, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Throwable t) {
+            return "cannot reach the main thread: " + t;
+        }
+        return out[0] == null ? "timed out removing the button" : out[0];
+    }
+
+    /**
+     * The view surgery itself. Runs on the main thread; returns a one-line outcome on every path.
+     *
+     * <p>Every visual property is inherited from the app's own toolbar rather than hard-coded: text
+     * size and colour from the sibling {@code id/sort} label, background from the theme's
+     * {@code selectableItemBackgroundBorderless}, geometry from {@code id/filter}'s own
+     * LayoutParams. The button therefore follows the app's theme — dark mode included — for free,
+     * and cannot look foreign next to the icons it sits beside.
+     *
+     * <p>{@code weight} is deliberately not copied. If {@code filter} is sized by weight and we
+     * copied it, a fourth child would silently re-split the row and shrink the three existing
+     * icons; taking the width while dropping the weight cannot disturb them.
+     */
+    private static String attachUnlockButton(String label, Integer widthPx, Integer sizeSp,
+                                             String why) {
+        Object frag = lastFragment;
+        if (frag == null) {
+            return "no FileTabListFragment seen yet -> open the 文件 tab first (" + why + ")";
+        }
+        Object rv = Reflectx.call0(frag, "getView");
+        if (!(rv instanceof android.view.View)) {
+            return "the file page view is not attached right now (" + why + ")";
+        }
+        android.view.View root = (android.view.View) rv;
+        Context ctx = app;
+
+        int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
+        if (idFilter == 0) {
+            return "R.id.filter is not resolvable (" + why + ")";
+        }
+        android.view.View filter = root.findViewById(idFilter);
+        if (filter == null) {
+            return "id/filter is not in the current file page view (" + why + ")";
+        }
+        android.view.View existing = unlockButton;
+        if (existing != null && existing.getParent() == filter.getParent()) {
+            return "unlock button is already in place (" + why + ")";
+        }
+        android.view.ViewParent vp = filter.getParent();
+        if (!(vp instanceof android.view.ViewGroup)) {
+            return "id/filter has no ViewGroup parent (" + why + ")";
+        }
+        android.view.ViewGroup parent = (android.view.ViewGroup) vp;
+
+        Context themed = filter.getContext() != null ? filter.getContext() : ctx;
+        android.widget.TextView b = new android.widget.TextView(themed);
+        b.setText(label != null && !label.isEmpty() ? label : BUTTON_LABEL);
+        b.setSingleLine(true);
+        b.setClickable(true);
+        b.setGravity(android.view.Gravity.CENTER);
+
+        android.widget.TextView sort = null;
+        int idSort = ctx.getResources().getIdentifier("sort", "id", APP_PKG);
+        if (idSort != 0) {
+            android.view.View v = root.findViewById(idSort);
+            if (v instanceof android.widget.TextView) {
+                sort = (android.widget.TextView) v;
+            }
+        }
+        if (sort != null) {
+            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, sort.getTextSize());
+            b.setTextColor(sort.getCurrentTextColor());
+        } else {
+            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f);
+        }
+        if (sizeSp != null) {
+            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, sizeSp.intValue());
+        }
+        int padX = Math.round(b.getTextSize() * 0.6f);
+        b.setPadding(padX, 0, padX, 0);
+        try {
+            android.util.TypedValue attr = new android.util.TypedValue();
+            if (themed.getTheme().resolveAttribute(
+                    android.R.attr.selectableItemBackgroundBorderless, attr, true)
+                    && attr.resourceId != 0) {
+                b.setBackgroundResource(attr.resourceId);
+            }
+        } catch (Throwable ignored) {
+            // purely cosmetic: a missing ripple must not stop the button from working
+        }
+
+        android.view.ViewGroup.LayoutParams src = filter.getLayoutParams();
+        android.view.ViewGroup.LayoutParams lp;
+        int srcW = src == null ? android.view.ViewGroup.LayoutParams.WRAP_CONTENT : src.width;
+        int srcH = src == null ? android.view.ViewGroup.LayoutParams.MATCH_PARENT : src.height;
+        if (srcW <= 0) {
+            srcW = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+        }
+        if (srcH <= 0) {
+            srcH = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+        }
+        final int w = widthPx != null ? widthPx.intValue() : srcW;
+        final int h = srcH;
+        if (src instanceof android.widget.LinearLayout.LayoutParams) {
+            android.widget.LinearLayout.LayoutParams s =
+                    (android.widget.LinearLayout.LayoutParams) src;
+            android.widget.LinearLayout.LayoutParams n =
+                    new android.widget.LinearLayout.LayoutParams(w, h);
+            n.gravity = s.gravity;
+            n.topMargin = s.topMargin;
+            n.bottomMargin = s.bottomMargin;
+            n.leftMargin = s.leftMargin;
+            n.rightMargin = s.rightMargin;
+            lp = n;
+        } else if (src instanceof android.widget.FrameLayout.LayoutParams) {
+            android.widget.FrameLayout.LayoutParams s =
+                    (android.widget.FrameLayout.LayoutParams) src;
+            lp = new android.widget.FrameLayout.LayoutParams(w, h, s.gravity);
+        } else {
+            lp = new android.view.ViewGroup.LayoutParams(w, h);
+        }
+
+        int at = parent.indexOfChild(filter);
+        parent.addView(b, at, lp);
+        unlockButton = b;
+
+        b.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override
+            public void onClick(android.view.View v) {
+                Logx.i("[button] clicked");
+                toast("BdCryptomator：保险库已识别，解锁功能将在下一阶段接入");
+            }
+        });
+
+        StringBuilder sb = new StringBuilder("unlock button inserted into ");
+        sb.append(parent.getClass().getName()).append(" id=").append(idName(parent))
+                .append(" index=").append(at).append('/').append(parent.getChildCount())
+                .append(" lp=").append(lp.getClass().getSimpleName())
+                .append('(').append(lp.width).append('x').append(lp.height).append(')')
+                .append(" parent=").append(parent.getWidth()).append('x').append(parent.getHeight())
+                .append(" text=").append(b.getText())
+                .append(" why=").append(why);
+        android.view.ViewParent up = parent.getParent();
+        if (up instanceof android.view.View) {
+            sb.append(" grandparent=").append(up.getClass().getSimpleName())
+                    .append(" id=").append(idName((android.view.View) up));
+        }
+        return sb.toString();
+    }
+
     /**
      * Prints the real view tree around {@code id/filter} as the app built it.
      *
@@ -690,30 +1003,44 @@ public final class Hooks {
         if (!toolbarDumped.compareAndSet(false, true)) {
             return;
         }
+        String s = buildToolbarTree(why);
+        if (s == null) {
+            // Not measurable yet. Release the one-shot guard so the next listing retries.
+            toolbarDumped.set(false);
+            return;
+        }
+        Logx.i(s);
+    }
+
+    /** Probe entry point: a retry costs a broadcast, not a reinstall. */
+    public static String toolbarTreeNow() {
+        String s = buildToolbarTree("probe");
+        return s == null ? "[toolbar] not measurable right now" : s;
+    }
+
+    /** @return the measurement, or null when it cannot be taken so the caller can retry later. */
+    private static String buildToolbarTree(String why) {
         try {
             Object f = lastFragment;
             if (f == null) {
                 Logx.w("[toolbar] no fragment yet; will retry on next resume");
-                toolbarDumped.set(false);
-                return;
+                return null;
             }
             Object rv = Reflectx.call0(f, "getView");
             if (!(rv instanceof android.view.View)) {
                 Logx.w("[toolbar] fragment view not available");
-                toolbarDumped.set(false);
-                return;
+                return null;
             }
             android.view.View root = (android.view.View) rv;
             int id = app == null ? -1 : app.getResources().getIdentifier("filter", "id", APP_PKG);
             if (id == -1) {
                 Logx.w("[toolbar] R.id.filter not resolvable");
-                return;
+                return null;
             }
             android.view.View v = root.findViewById(id);
             if (v == null) {
                 Logx.w("[toolbar] id/filter not under the fragment view");
-                toolbarDumped.set(false);
-                return;
+                return null;
             }
 
             StringBuilder sb = new StringBuilder("[toolbar] view chain of id/filter (")
@@ -760,9 +1087,10 @@ public final class Hooks {
                 }
                 cur = (p instanceof android.view.View) ? (android.view.View) p : null;
             }
-            Logx.i(sb.toString());
+            return sb.toString();
         } catch (Throwable t) {
             Logx.w("[toolbar] dump failed: " + t);
+            return null;
         }
     }
 
@@ -833,6 +1161,10 @@ public final class Hooks {
                 + "\n  cursor sets : " + cursorColumns.size()
                 + "\n  urls        : " + urls.size()
                 + "\n  vaults      : " + vaultsAnnounced
+                + "\n  vault dirs  : " + vaultDirs
+                + "\n  button      : " + (unlockButton == null
+                        ? "not injected"
+                        : (unlockButton.getParent() == null ? "detached" : "in the toolbar"))
                 + "\n  missing     : " + missingTargets;
     }
 

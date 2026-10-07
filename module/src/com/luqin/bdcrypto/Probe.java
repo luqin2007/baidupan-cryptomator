@@ -79,6 +79,10 @@ public final class Probe {
             Logx.i(Hooks.stateSummary());
         } else if ("net".equals(cmd)) {
             Logx.i(Hooks.dumpHttpUrls());
+        } else if ("tree".equals(cmd)) {
+            Logx.i(Hooks.toolbarTreeNow());
+        } else if ("btn".equals(cmd)) {
+            Logx.i(Hooks.buttonCommand(arg));
         } else {
             Logx.w("unknown cmd: " + cmd);
             help();
@@ -96,6 +100,9 @@ public final class Probe {
                 + "  items                     every CloudFile row captured from the Cursor so far\n"
                 + "  columns                   distinct Cursor column-name sets seen\n"
                 + "  net                       HTTP URLs observed\n"
+                + "  tree                      measure the toolbar view tree around id/filter, again\n"
+                + "  btn [args]                inject / style / remove the unlock button\n"
+                + "                              off | text=<label> | w=<px> | size=<sp>\n"
                 + "  state                     one-line summary of what has been captured\n"
                 + "  ls | clear                list / delete probe report files");
     }
