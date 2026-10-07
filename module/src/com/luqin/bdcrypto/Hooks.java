@@ -855,13 +855,14 @@ public final class Hooks {
      *
      * <p>Every visual property is inherited from the app's own toolbar rather than hard-coded: text
      * size and colour from the sibling {@code id/sort} label, background from the theme's
-     * {@code selectableItemBackgroundBorderless}, geometry from {@code id/filter}'s own
+     * {@code selectableItemBackgroundBorderless}, height and margins from the anchor's own
      * LayoutParams. The button therefore follows the app's theme — dark mode included — for free,
-     * and cannot look foreign next to the icons it sits beside.
+     * and cannot look foreign next to the icons it sits beside. Width is the exception: it is
+     * WRAP_CONTENT so a two-character label is never clipped inside an icon-sized box.
      *
-     * <p>{@code weight} is deliberately not copied. If {@code filter} is sized by weight and we
-     * copied it, a fourth child would silently re-split the row and shrink the three existing
-     * icons; taking the width while dropping the weight cannot disturb them.
+     * <p>{@code weight} is deliberately not copied. If the anchor were weight-sized and we copied
+     * it, an extra child would silently re-split the row and shrink the existing icons; taking the
+     * geometry while dropping the weight cannot disturb them.
      */
     private static String attachUnlockButton(String label, Integer widthPx, Integer sizeSp,
                                              String why) {
@@ -870,31 +871,65 @@ public final class Hooks {
             return "no FileTabListFragment seen yet -> open the 文件 tab first (" + why + ")";
         }
         Object rv = Reflectx.call0(frag, "getView");
-        if (!(rv instanceof android.view.View)) {
-            return "the file page view is not attached right now (" + why + ")";
-        }
-        android.view.View root = (android.view.View) rv;
         Context ctx = app;
 
         int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
         if (idFilter == 0) {
             return "R.id.filter is not resolvable (" + why + ")";
         }
-        android.view.View filter = root.findViewById(idFilter);
+        int idFilterLabel = ctx.getResources().getIdentifier("filter_dialog_enter", "id", APP_PKG);
+
+        android.view.View root = rv instanceof android.view.View ? (android.view.View) rv : null;
+        android.view.View filter = root == null ? null : root.findViewById(idFilter);
+        String via = "fragment view";
         if (filter == null) {
+            // getView() is null or stale for a moment after the fragment is recreated. The host
+            // activity's decor view holds the same toolbar and is never stale, so look there
+            // instead of waiting for another navigation.
+            Object act = Reflectx.call0(frag, "getActivity");
+            if (act instanceof android.app.Activity) {
+                android.view.Window w = ((android.app.Activity) act).getWindow();
+                android.view.View decor = w == null ? null : w.getDecorView();
+                filter = decor == null ? null : decor.findViewById(idFilter);
+                if (filter != null) {
+                    root = decor;
+                    via = "host activity decor view";
+                }
+            }
+        }
+        if (filter == null || root == null) {
             return "id/filter is not in the current file page view (" + why + ")";
         }
+
+        // The "筛选" control is a two-view group, not one view: id/filter_dialog_enter is the label
+        // and id/filter is the icon, and the live tree measures them flush against each other (0 px
+        // apart) as a single tap target. Anchoring on id/filter would drop the button between the
+        // word and its own icon and split the app's control in half, so the anchor is whichever of
+        // the two comes first in the row.
+        android.view.View anchor = filter;
+        if (idFilterLabel != 0) {
+            android.view.View lbl = root.findViewById(idFilterLabel);
+            android.view.ViewParent lp0 = lbl == null ? null : lbl.getParent();
+            if (lp0 != null && lp0 == filter.getParent() && lp0 instanceof android.view.ViewGroup) {
+                android.view.ViewGroup g = (android.view.ViewGroup) lp0;
+                if (g.indexOfChild(lbl) < g.indexOfChild(filter)) {
+                    anchor = lbl;
+                }
+            }
+        }
+
         android.view.View existing = unlockButton;
-        if (existing != null && existing.getParent() == filter.getParent()) {
+        if (existing != null && existing.getParent() == anchor.getParent()) {
             return "unlock button is already in place (" + why + ")";
         }
-        android.view.ViewParent vp = filter.getParent();
+        android.view.ViewParent vp = anchor.getParent();
         if (!(vp instanceof android.view.ViewGroup)) {
-            return "id/filter has no ViewGroup parent (" + why + ")";
+            return "id/" + (anchor == filter ? "filter" : "filter_dialog_enter")
+                    + " has no ViewGroup parent (" + why + ")";
         }
         android.view.ViewGroup parent = (android.view.ViewGroup) vp;
 
-        Context themed = filter.getContext() != null ? filter.getContext() : ctx;
+        Context themed = anchor.getContext() != null ? anchor.getContext() : ctx;
         android.widget.TextView b = new android.widget.TextView(themed);
         b.setText(label != null && !label.isEmpty() ? label : BUTTON_LABEL);
         b.setSingleLine(true);
@@ -931,17 +966,18 @@ public final class Hooks {
             // purely cosmetic: a missing ripple must not stop the button from working
         }
 
-        android.view.ViewGroup.LayoutParams src = filter.getLayoutParams();
+        android.view.ViewGroup.LayoutParams src = anchor.getLayoutParams();
         android.view.ViewGroup.LayoutParams lp;
-        int srcW = src == null ? android.view.ViewGroup.LayoutParams.WRAP_CONTENT : src.width;
         int srcH = src == null ? android.view.ViewGroup.LayoutParams.MATCH_PARENT : src.height;
-        if (srcW <= 0) {
-            srcW = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
-        }
         if (srcH <= 0) {
             srcH = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
         }
-        final int w = widthPx != null ? widthPx.intValue() : srcW;
+        // Width is WRAP_CONTENT by default and is deliberately NOT copied from the anchor. The
+        // anchor is an icon-sized view (id/filter measures 86 px wide), and a two-character label
+        // would be clipped inside that; the row has ~557 px of slack between the sort cluster and
+        // this one, so letting the label size itself costs nothing.
+        final int w = widthPx != null ? widthPx.intValue()
+                : android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
         final int h = srcH;
         if (src instanceof android.widget.LinearLayout.LayoutParams) {
             android.widget.LinearLayout.LayoutParams s =
@@ -962,9 +998,10 @@ public final class Hooks {
             lp = new android.view.ViewGroup.LayoutParams(w, h);
         }
 
-        int at = parent.indexOfChild(filter);
+        int at = parent.indexOfChild(anchor);
         parent.addView(b, at, lp);
         unlockButton = b;
+        watchForOverflow(parent, b, why);
 
         b.setOnClickListener(new android.view.View.OnClickListener() {
             @Override
@@ -981,6 +1018,8 @@ public final class Hooks {
                 .append('(').append(lp.width).append('x').append(lp.height).append(')')
                 .append(" parent=").append(parent.getWidth()).append('x').append(parent.getHeight())
                 .append(" text=").append(b.getText())
+                .append(" anchor=").append(anchor == filter ? "filter" : "filter_dialog_enter")
+                .append(" via=").append(via)
                 .append(" why=").append(why);
         android.view.ViewParent up = parent.getParent();
         if (up instanceof android.view.View) {
@@ -988,6 +1027,62 @@ public final class Hooks {
                     .append(" id=").append(idName((android.view.View) up));
         }
         return sb.toString();
+    }
+
+    /**
+     * Reports, once, whether the button actually fits — measured after layout rather than reasoned
+     * about beforehand.
+     *
+     * <p>The accessibility dump shows a 557 px gap in the middle of the toolbar row but not what
+     * occupies it, and the answer decides the outcome: a weighted spacer shrinks and absorbs the
+     * button harmlessly, whereas hard margins would push {@code id/switch_layout_icon} — which
+     * already ends at x=1036 of 1080 — off the screen. The two cases are indistinguishable from the
+     * dump, so this measures the laid-out result instead of guessing. It only reports; it never
+     * removes the button, because a visible button that overflows still says far more than a
+     * silently absent one.
+     */
+    private static void watchForOverflow(final android.view.ViewGroup parent,
+                                         final android.view.View self, final String why) {
+        try {
+            final boolean[] done = {false};
+            self.getViewTreeObserver().addOnGlobalLayoutListener(
+                    new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                        @Override
+                        public void onGlobalLayout() {
+                            if (done[0]) {
+                                return;
+                            }
+                            done[0] = true;
+                            try {
+                                int limit = parent.getWidth();
+                                if (limit <= 0) {
+                                    return;
+                                }
+                                int selfTop = self.getTop();
+                                for (int i = 0; i < parent.getChildCount(); i++) {
+                                    android.view.View c = parent.getChildAt(i);
+                                    if (c == self || c.getTop() != selfTop) {
+                                        continue;
+                                    }
+                                    if (c.getRight() > limit) {
+                                        Logx.w("[button] OVERFLOW: " + idName(c) + " ends at x="
+                                                + c.getRight() + " in a " + limit
+                                                + " px row (" + why + "). Shrink with `am broadcast"
+                                                + " -a com.luqin.bdcrypto.PROBE --es cmd btn --es arg"
+                                                + " w=110`, or move the anchor.");
+                                        return;
+                                    }
+                                }
+                                Logx.i("[button] fits: row laid out within " + limit
+                                        + " px, everything left of the edge (" + why + ")");
+                            } catch (Throwable t) {
+                                Logx.w("[button] overflow check failed: " + t);
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            Logx.w("[button] cannot install overflow check: " + t);
+        }
     }
 
     /**
