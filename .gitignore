@@ -1,0 +1,38 @@
+# ------------------------------------------------------------------ secrets --
+# Signing material. NEVER commit: a published keystore lets anyone sign an APK
+# that installs as an update over the official one.
+module/keystore/
+module/keystore.properties
+
+# ------------------------------------------------------- proprietary input --
+# The Baidu Netdisk installer (~243 MB, proprietary, not redistributable) and
+# anything extracted out of it. See docs/recon.md for how the analysis tree is
+# rebuilt locally.
+base.apk
+split_config*.apk
+*.idsig
+
+# ------------------------------------------------- third-party runtime libs --
+# Cryptomator's cryptolib + siv-mode are AGPL-3.0 and are NOT vendored here.
+# module/tools/fetch-libs.sh reproduces them from a local Cryptomator install or
+# from Maven Central.
+module/libs/*.jar
+module/libs/*.aar
+
+# --------------------------------------------------------- build artefacts --
+module/build/
+dist/
+
+# --------------------------------------------- reverse-engineering scratch ----
+# On-device probe reports carry real cloud paths and file ids.
+recon/
+work/
+probe/
+
+# -------------------------------------------------------------------- misc --
+*.log
+.DS_Store
+Thumbs.db
+
+# Agent workspace metadata (local paths, session notes) - not project source.
+.workbuddy/

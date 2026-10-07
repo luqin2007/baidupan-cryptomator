@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">网盘 Cryptomator</string>
+    <string name="module_description">在百度网盘 App 的文件页就地读写 Cryptomator 保险库：识别 vault.cryptomator / masterkey.cryptomator，输入口令后把加密目录 d/ 展示成解密后的文件名与目录树，下载时自动解密，删除/重命名等操作透传回原始密文。主口令只在内存中参与运算，不落盘。</string>
+</resources>

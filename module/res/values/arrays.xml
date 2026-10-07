@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Only the Baidu Netdisk app is ever hooked. -->
+    <string-array name="xposedscope">
+        <item>com.baidu.drive.app</item>
+    </string-array>
+</resources>

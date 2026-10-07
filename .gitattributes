@@ -1,0 +1,14 @@
+# Force LF everywhere in the working tree. The repository is meant to be cloned
+# and built on Linux/macOS as well as Windows: a CRLF shebang breaks bash, and a
+# CRLF line in assets/xposed_init risks breaking the class name LSPosed reads.
+* text=auto eol=lf
+
+# Never touch these.
+*.apk      binary
+*.idsig    binary
+*.keystore binary
+*.jks      binary
+*.jar      binary
+*.dex      binary
+*.png      binary
+*.jpg      binary
