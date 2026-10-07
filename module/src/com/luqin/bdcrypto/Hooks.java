@@ -90,8 +90,36 @@ public final class Hooks {
     private static final Set<String> vaultDirs =
             Collections.synchronizedSet(new HashSet<String>());
 
-    /** The injected unlock button, or null. Held so it can be removed without searching the tree. */
-    private static volatile android.view.View unlockButton;
+    /** Marks a view as ours, so "is the button already in this toolbar" needs no bookkeeping. */
+    private static final Object TAG_UNLOCK = new Object();
+
+    /**
+     * One line describing the last injection attempt, for {@link #stateSummary()}.
+     *
+     * <p>There is deliberately no "the button" field any more. A page carries <em>two</em> toolbars
+     * that both hold an {@code id/filter} — the live one inside {@code id/list_recycler_view} and a
+     * second inside {@code id/empty_headers} — and the window holds more than one page at once
+     * (measured: four {@code id/filter} across three page containers, two of which share a
+     * breadcrumb). Which one is drawn on top is not something the module controls, so a single
+     * remembered reference can only ever describe one of them, and "the button already exists"
+     * decided from it was wrong most of the time. Identity now lives on the views themselves: every
+     * injected child carries {@link #TAG_UNLOCK}, so each question — does this toolbar have a button,
+     * remove it, restyle it — is asked of the toolbar it is about.
+     */
+    private static volatile String buttonSummary = "not injected";
+
+    /** The last directory recognised as a vault, so the probe can re-inject on demand. */
+    private static volatile String lastVaultDir;
+
+    /**
+     * The directory the drawn page is believed to be on — what the button is currently for, or null
+     * when that page is not a vault.
+     *
+     * <p>Kept because a retry chain needs to know when to stop. Its whole purpose is to wait for one
+     * particular page to finish settling, so the moment the drawn page is a different one the
+     * question it is asking has no answer, and it can go.
+     */
+    private static volatile String lastWantedDir;
 
     /** So the toolbar dump is produced once per process, not once per vault. */
     private static final java.util.concurrent.atomic.AtomicBoolean toolbarDumped =
@@ -161,6 +189,7 @@ public final class Hooks {
         int before = missingTargets.size();
         hookFileListFragment();
         hookRecyclerAdapter();
+        hookBreadcrumb();
         hookCloudFileModel();
         hookCursorColumns();
         hookNetwork();
@@ -210,10 +239,11 @@ public final class Hooks {
 
     private static void onFragmentEvent(String where, Object fragment) {
         if ("onDestroyView".equals(where)) {
-            // The view tree (and the injected button with it) is thrown away here. Dropping the
-            // reference is what allows the next listing to inject a fresh one — keeping it would
-            // leave a detached view that "already exists" for ever.
-            unlockButton = null;
+            // The view tree (and the injected button with it) is thrown away here, so the summary
+            // must not keep claiming a button that no longer exists.
+            buttonSummary = "not injected (view destroyed)";
+            armedButtons = 0;
+            lastLoggedOutcome = null;
         }
         lastFragment = fragment;
         lastFragmentWhere = where + "@" + android.os.SystemClock.uptimeMillis();
@@ -226,6 +256,9 @@ public final class Hooks {
             Report.write(app, "graph-" + where + ".txt", g);
         }
         Logx.i("[fragment.graph " + where + "] " + truncate(g, 1800));
+        // A page being created or resumed is one of the few moments a directory can have changed,
+        // and it costs a quarter-second-delayed tree read to be sure.
+        reconcileSoon("fragment " + where);
         if ("onResume".equals(where) && !vaultsAnnounced.isEmpty()) {
             // The vault may have been recognised while no fragment was on screen; the toolbar only
             // exists now, so this is the second chance to measure it.
@@ -270,6 +303,46 @@ public final class Hooks {
             Logx.i("hooked RecyclerView.setAdapter");
         } catch (Throwable t) {
             note("hook RecyclerView.setAdapter failed: " + t);
+        }
+    }
+
+    /**
+     * Watches the breadcrumb for directory changes. This is the trigger the button lives on.
+     *
+     * <p>Chosen after the two obvious triggers were measured to be absent in the one case that
+     * matters. Walking back from /crypto/content/d to /crypto/content produced <em>no</em>
+     * CloudFile — the listing is served from cache, so nothing is constructed, so
+     * {@link #detectVault} never runs — and <em>no</em> fragment lifecycle event, because the page
+     * view is kept and merely re-fed. The breadcrumb is the one thing that always changes: its items
+     * <em>are</em> the directory names.
+     *
+     * <p>Hooked on the class rather than on an instance because the app sets a fresh adapter on
+     * every file page; hooking the class covers every one of them, including pages built later.
+     */
+    private static void hookBreadcrumb() {
+        String name = "com.baidu.netdisk.ui.breadcrumb.BreadcrumbAdapter";
+        Class<?> c = XposedHelpers.findClassIfExists(name, cl);
+        if (c == null) {
+            note("missing target: " + name);
+            return;
+        }
+        try {
+            XposedBridge.hookAllMethods(c, "onBindViewHolder", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    safe("BreadcrumbAdapter.onBindViewHolder", new Body() {
+                        @Override
+                        public void run() {
+                            // Once per crumb item, so two or three times per directory change; the
+                            // pending flag in reconcileSoon collapses them into one pass.
+                            reconcileSoon("breadcrumb bound");
+                        }
+                    });
+                }
+            });
+            Logx.i("hooked " + name + " for directory changes");
+        } catch (Throwable t) {
+            note("hook " + name + " failed: " + t);
         }
     }
 
@@ -640,6 +713,10 @@ public final class Hooks {
      *
      * <p>Costs nothing: it reads data the app already produced. The only side effects are one log
      * line, one toast, and (once per process) a dump of the toolbar's real view tree.
+     *
+     * <p>Deliberately knows nothing about buttons beyond asking for a reconcile. The set of vault
+     * directories is the one thing that has to be learned from the rows; whether a button should be
+     * on screen right now is a question about the breadcrumb, and {@link #reconcile} answers it.
      */
     private static void detectVault(String path, String name) {
         if (path == null || name == null) {
@@ -650,7 +727,7 @@ public final class Hooks {
         // Fast path: this directory is already known to be a vault, so the listing now arriving is
         // the app re-opening it. The view was rebuilt, so the button has to be put back.
         if (vaultDirs.contains(dir)) {
-            ensureUnlockButton(dir);
+            noteVaultDir(dir);
             return;
         }
 
@@ -675,7 +752,7 @@ public final class Hooks {
             toast("BdCryptomator：检测到 Cryptomator 保险库\n" + dir);
             dumpToolbarTree("vault at " + dir);
         }
-        ensureUnlockButton(dir);
+        noteVaultDir(dir);
     }
 
     /** The directory a path lives in, treating a shallower path as root. */
@@ -684,19 +761,169 @@ public final class Hooks {
         return slash <= 0 ? "/" : path.substring(0, slash);
     }
 
+    /** Whether a reconcile is already queued; a burst of triggers collapses into one pass. */
+    private static final java.util.concurrent.atomic.AtomicBoolean reconcilePending =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
     /**
-     * Puts the unlock button into the toolbar, if it is not already there.
+     * Queues one {@link #reconcile()} shortly.
      *
-     * <p>Called from the row path, which runs on the app's loader thread, so the actual view
-     * surgery is posted to the main thread and this returns immediately — a listing must never wait
-     * on us.
+     * <p>The delay is what lets a directory change settle before it is judged. Arriving somewhere
+     * fires this from the breadcrumb's rebind, from the first CloudFile row and from the fragment's
+     * resume, all while the app is still swapping pages; acting on the first of those would read the
+     * breadcrumb of the directory being <em>left</em>. One pending pass is enough — later triggers
+     * only move it, and the pass re-reads the tree from scratch.
      */
-    private static void ensureUnlockButton(String dir) {
-        android.view.View b = unlockButton;
-        if (b != null && b.getParent() != null) {
+    private static void reconcileSoon(final String why) {
+        if (reconcilePending.getAndSet(true)) {
             return;
         }
-        injectUnlockButton(null, null, null, "vault at " + dir, false);
+        try {
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    reconcilePending.set(false);
+                    try {
+                        reconcile(why);
+                    } catch (Throwable t) {
+                        Logx.w("[button] reconcile failed: " + t);
+                    }
+                }
+            }, 250);
+        } catch (Throwable t) {
+            reconcilePending.set(false);
+        }
+    }
+
+    /**
+     * Makes the toolbar match the directory the window is <em>drawing</em> — the whole of the
+     * button's state, derived from one readable fact rather than from a stream of events.
+     *
+     * <p>Deriving it is not a stylistic choice; the events are unreliable in both directions.
+     * Measured: walking back from /crypto/content/d to /crypto/content produced <em>no</em>
+     * CloudFile at all (the listing is served from cache), <em>no</em> fragment lifecycle event (the
+     * page view is kept alive), and therefore no button — the only trigger was a row being
+     * constructed. Measured the other way: walking <em>into</em> /crypto/content/d left the vault
+     * page in the window still wearing its button, because nothing notices a directory that has
+     * merely stopped being listed.
+     *
+     * <p>The fact that is always right is the breadcrumb, so it is what this reads: the drawn page's
+     * crumb names the directory, the button belongs there and nowhere else, and everything else —
+     * the other page copies, the empty-state toolbar, the pages left behind — is swept.
+     */
+    private static void reconcile(String why) {
+        final Context ctx = app;
+        if (ctx == null) {
+            return;
+        }
+        final int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
+        final int idCrumb = ctx.getResources().getIdentifier("rv_breadcrumb", "id", APP_PKG);
+        java.util.List<android.view.View> copies = allCopies(idFilter);
+        if (copies.isEmpty()) {
+            return;
+        }
+
+        // Which directory is the drawn page on? Among the pages in the window, the drawn one is the
+        // last, and that is not interchangeable with the first.
+        //
+        // Measured: the app moves the current page's container to the end of its parent's child list
+        // — the same container reported itself as child 1 of 3 while another page was on top and as
+        // child 2 of 3 once it became current — and a later sibling draws over an earlier one. View
+        // order in a depth-first walk is child order, so the last copy found is the top page.
+        //
+        // isShown() alone cannot answer this and says so loudly: measured, the page behind reports
+        // shown=true as well, because it is VISIBLE and attached and merely painted over. Taking the
+        // first shown copy therefore picked the page <em>behind</em> — /crypto while the user was
+        // looking at /crypto/content — read it as "not a vault", and swept the button away.
+        String drawn = null;
+        android.view.View drawnCopy = null;
+        for (int i = copies.size() - 1; i >= 0; i--) {
+            android.view.View f = copies.get(i);
+            if (!f.isShown()) {
+                continue;
+            }
+            String crumb = crumbPathOf(f, idFilter, idCrumb);
+            if (crumb != null) {
+                drawn = crumb;
+                drawnCopy = f;
+                break;
+            }
+        }
+        if (drawn == null) {
+            // Nothing readable: mid-transition, or the app is somewhere else entirely. Leaving the
+            // tree alone is the safe answer — the next trigger is at most a quarter second away.
+            return;
+        }
+
+        String vault = vaultDirMatching(drawn);
+        lastWantedDir = vault;
+        if (vault != null) {
+            // Restricted to the drawn page's own subtree. The window can hold two containers that
+            // both show the same directory — measured, four copies over two containers, each
+            // reporting shown=true — and without this both get a button, at the same coordinates,
+            // one painted over the other. They are different pages, so the page root tells them
+            // apart where the breadcrumb, the bounds and isShown() all agree.
+            Logx.i("[button] " + attachUnlockButtons(vault, null, null, null,
+                    why + ", drawn page is " + drawn,
+                    pageRootOf(drawnCopy, idFilter, idCrumb)));
+        } else {
+            sweepAllOurButtons(why + ", drawn page is " + drawn);
+        }
+    }
+
+    /** The known vault directory that {@code crumb} names, or null. Longest match wins. */
+    private static String vaultDirMatching(String crumb) {
+        String best = null;
+        for (String d : vaultDirs) {
+            if (samePath(crumb, d) && (best == null || d.length() > best.length())) {
+                best = d;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Takes this module's button out of every toolbar copy in the window. Main thread.
+     *
+     * <p>Every copy, not just the drawn one: a page that has merely stopped being listed is still in
+     * the window, and a button left on it is a button that reappears the moment the app brings that
+     * page back. Measured — entering /crypto/content/d from the vault kept the vault page and its
+     * button in the window, invisible but present in the accessibility tree at [641,398][767,470].
+     */
+    private static int sweepAllOurButtons(final String why) {
+        final Context ctx = app;
+        if (ctx == null) {
+            return 0;
+        }
+        int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
+        java.util.List<android.view.View> parents = new java.util.ArrayList<android.view.View>();
+        for (android.view.View c : allCopies(idFilter)) {
+            android.view.ViewParent p = c.getParent();
+            if (p instanceof android.view.ViewGroup && !parents.contains(p)) {
+                parents.add((android.view.View) p);
+            }
+        }
+        int n = 0;
+        for (android.view.View p : parents) {
+            n += removeOurChildren((android.view.ViewGroup) p);
+        }
+        if (n > 0) {
+            armedButtons = 0;
+            buttonSummary = "swept " + n + " button(s) off (" + why + ")";
+            logOnce(buttonSummary);
+        }
+        return n;
+    }
+
+    /**
+     * A vault directory has been recognised: remember it for the probe, and re-derive the button.
+     *
+     * <p>Called from the row path, which runs on the app's loader thread, so nothing here touches a
+     * view — a listing must never wait on us. The reconcile that does the work is posted.
+     */
+    private static void noteVaultDir(String dir) {
+        lastVaultDir = dir;
+        reconcileSoon("vault at " + dir);
     }
 
     /** A visible acknowledgement that the whole detect path ran, on the app's own UI. */
@@ -726,7 +953,8 @@ public final class Hooks {
     private static final String BUTTON_LABEL = "解锁";
 
     /**
-     * {@code btn} probe command: {@code off} removes the button, anything else (re)injects it.
+     * {@code btn} probe command: {@code off} removes the button from every page copy, {@code diag}
+     * reports what each copy is showing and what is in it, anything else (re)injects it.
      *
      * <p>Optional overrides, comma separated: {@code w=<px>} (width), {@code size=<sp>} (text size),
      * {@code text=<label>}. They exist because the button's geometry has to be judged against the
@@ -735,9 +963,11 @@ public final class Hooks {
     public static String buttonCommand(String arg) {
         String a = arg == null ? "" : arg.replace(" ", "");
         if ("off".equalsIgnoreCase(a) || "rm".equalsIgnoreCase(a) || "0".equals(a)) {
-            String r = detachUnlockButton("probe");
-            Logx.i("[button] " + r);
+            String r = detachUnlockButtons("probe");
             return r;
+        }
+        if ("diag".equalsIgnoreCase(a) || "copies".equalsIgnoreCase(a)) {
+            return copiesReport("probe");
         }
         Integer w = null;
         Integer size = null;
@@ -764,269 +994,792 @@ public final class Hooks {
                 // a malformed override must not fail the whole command
             }
         }
-        String r = injectUnlockButton(label, w, size, "probe", true);
-        Logx.i("[button] " + (r == null ? "posted, no result captured" : r));
-        return r;
+        // The caller (the probe) logs the returned line, so this deliberately does not. lastWantedDir
+        // is set here too, so a retry chain this starts knows what it is waiting for.
+        lastWantedDir = lastVaultDir;
+        return injectUnlockButtons(lastVaultDir, label, w, size, "probe");
     }
 
     /**
-     * @return the outcome, or null when {@code await} is false (the caller is the row path and must
-     *     not block). Never throws.
+     * Runs one attach on the main thread and hands back its line. Used by the {@code btn} probe,
+     * which is the only caller that wants the answer; everything else goes through {@link #reconcile}
+     * and does not care.
      */
-    private static String injectUnlockButton(final String label, final Integer widthPx,
-                                             final Integer sizeSp, final String why,
-                                             final boolean await) {
+    private static String injectUnlockButtons(final String vaultDir, final String label,
+                                              final Integer widthPx, final Integer sizeSp,
+                                              final String why) {
         if (app == null) {
-            Logx.w("[button] no app context yet (" + why + ")");
+            return "no app context yet (" + why + ")";
+        }
+        return onMain(new Call() {
+            @Override
+            public String run() {
+                return attachUnlockButtons(vaultDir, label, widthPx, sizeSp, why, null);
+            }
+        }, "attach " + why);
+    }
+
+    /**
+     * Takes the button back out of every copy of the file page, for the {@code btn off} probe.
+     *
+     * <p>Emptying the whole window is the point: "which copy did I put it in" is exactly the
+     * question that produced an invisible button, and the answer is not worth remembering when
+     * finding every copy takes one traversal.
+     */
+    private static String detachUnlockButtons(final String why) {
+        return onMain(new Call() {
+            @Override
+            public String run() {
+                int n = sweepAllOurButtons(why);
+                if (n == 0) {
+                    buttonSummary = "not injected";
+                    lastLoggedOutcome = buttonSummary;
+                    return buttonSummary;
+                }
+                return buttonSummary;
+            }
+        }, "remove " + why);
+    }
+
+    /** Every copy of {@code id} in the current window, in draw order; empty when not measurable. */
+    private static java.util.List<android.view.View> allCopies(int id) {
+        java.util.List<android.view.View> out = new java.util.ArrayList<android.view.View>();
+        if (id == 0) {
+            return out;
+        }
+        android.app.Activity act = activityOf(lastFragment);
+        android.view.View decor = act == null || act.getWindow() == null
+                ? null : act.getWindow().getDecorView();
+        collectById(decor, id, out);
+        if (out.isEmpty()) {
+            android.view.View fv = fragmentViewOf(lastFragment);
+            if (fv != null) {
+                android.view.View one = fv.findViewById(id);
+                if (one != null) {
+                    out.add(one);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Removes every child of {@code parent} that carries {@link #TAG_UNLOCK}. */
+    private static int removeOurChildren(android.view.ViewGroup parent) {
+        int n = 0;
+        for (int i = parent.getChildCount() - 1; i >= 0; i--) {
+            android.view.View c = parent.getChildAt(i);
+            if (c.getTag() == TAG_UNLOCK) {
+                parent.removeViewAt(i);
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * The view surgery itself. Runs on the main thread; returns a one-line outcome on every path.
+     *
+     * <p>The window holds two complete copies of the file page at once and either can be the one
+     * being drawn, so this reasons per copy rather than picking one:
+     *
+     * <ol>
+     *   <li>enumerate every {@code id/filter} in the window,</li>
+     *   <li>ask each copy which directory <em>it</em> is showing — from its own breadcrumb, since
+     *       class, ids and bounds are identical between copies and only the crumbs differ,</li>
+     *   <li>put the button in the copies showing the vault, and take it out of the others.</li>
+     * </ol>
+     *
+     * <p>Styling is deliberately explicit rather than inherited. The first version copied its text
+     * colour from a sibling and was measured on screen as <em>#FFFFFF on #FFFFFF</em> — present in
+     * the accessibility tree, clickable, and invisible. A fixed blue pill with white text cannot
+     * fail that way, and it matches the app's own selected chip.
+     */
+    private static String attachUnlockButtons(final String vaultDir, final String label,
+                                              final Integer widthPx, final Integer sizeSp,
+                                              final String why, final android.view.View pageRoot) {
+        // Reset up front, not at the end: every early return below is a "nothing was armed" answer,
+        // and a stale count would make the retry chain believe it had already succeeded.
+        armedButtons = 0;
+        final Context ctx = app;
+        if (ctx == null) {
+            return "no app context (" + why + ")";
+        }
+        final int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
+        if (idFilter == 0) {
+            return "R.id.filter is not resolvable (" + why + ")";
+        }
+        final int idFilterLabel =
+                ctx.getResources().getIdentifier("filter_dialog_enter", "id", APP_PKG);
+        final int idCrumb = ctx.getResources().getIdentifier("rv_breadcrumb", "id", APP_PKG);
+        final int idSort = ctx.getResources().getIdentifier("sort", "id", APP_PKG);
+
+        java.util.List<android.view.View> copies = allCopies(idFilter);
+        if (copies.isEmpty()) {
+            if (scheduleShownRetry(vaultDir, label, widthPx, sizeSp, why, pageRoot)) {
+                return "no id/filter anywhere yet; retrying (" + why + ")";
+            }
+            return "id/filter is not in the current file page view (" + why + ")";
+        }
+
+        // Which copy is a page of the vault directory? Only the breadcrumb can say, and it says it
+        // per copy: measured, the copy showing /crypto/content holds crumbs [crypto, content] while
+        // the copy behind it holds [crypto].
+        StringBuilder sb = new StringBuilder();
+        int wanted = 0;
+        final boolean[] isTarget = new boolean[copies.size()];
+        final String[] paths = new String[copies.size()];
+        for (int i = 0; i < copies.size(); i++) {
+            paths[i] = crumbPathOf(copies.get(i), idFilter, idCrumb);
+            boolean mine = pageRoot == null
+                    || pageRootOf(copies.get(i), idFilter, idCrumb) == pageRoot;
+            if (mine && paths[i] != null
+                    && (vaultDir == null || samePath(paths[i], vaultDir))) {
+                isTarget[i] = true;
+                wanted++;
+            }
+        }
+
+        // A page of the vault is not one toolbar but two: the live one inside id/list_recycler_view,
+        // and a second inside id/empty_headers that the app keeps GONE whenever the list has rows.
+        // Both resolve to the same directory — measured, both sit under the same
+        // RelativeLayout#root with crumbs=1 — so attributing by directory alone still picks the
+        // off-screen one as well, and a button placed there is invisible: present in the tree,
+        // shown=false, zero-size, and simply not on screen. Only the drawn copy gets the button.
+        for (int i = 0; i < copies.size(); i++) {
+            if (isTarget[i] && !copies.get(i).isShown()) {
+                isTarget[i] = false;
+                wanted--;
+            }
+        }
+        int placed = 0, removed = 0, kept = 0;
+        if (wanted == 0) {
+            // Either no copy has settled on the vault yet (the listing arrives while the page still
+            // belongs to the directory just left, so every breadcrumb is a valid but wrong answer),
+            // or the matching copy is not laid out yet. Neither justifies injecting into a copy that
+            // cannot be seen — that is what produced an invisible button — so retry instead. What it
+            // does justify is clearing out any button left from before, which the loop below does
+            // because no copy is a target.
+            for (int i = 0; i < copies.size(); i++) {
+                android.view.ViewParent vp = copies.get(i).getParent();
+                if (vp instanceof android.view.ViewGroup) {
+                    removed += removeOurChildren((android.view.ViewGroup) vp);
+                }
+            }
+            buttonSummary = "placed=0 kept=0 removed=" + removed
+                    + " of " + copies.size() + " copy/copies (none is " + vaultDir + ")";
+            lastLoggedOutcome = buttonSummary;
+            boolean retried = scheduleShownRetry(vaultDir, label, widthPx, sizeSp, why, pageRoot);
+            return buttonSummary + " (of " + java.util.Arrays.toString(paths) + ")"
+                    + (retried ? "; retrying" : "") + " (" + why + ")";
+        }
+        for (int i = 0; i < copies.size(); i++) {
+            android.view.View filter = copies.get(i);
+            android.view.ViewParent vp = filter.getParent();
+            if (!(vp instanceof android.view.ViewGroup)) {
+                sb.append("copy ").append(i).append(": id/filter has no ViewGroup parent; ");
+                continue;
+            }
+            android.view.ViewGroup parent = (android.view.ViewGroup) vp;
+            if (!isTarget[i]) {
+                int n = removeOurChildren(parent);
+                removed += n;
+                sb.append("copy ").append(i).append(": ").append(paths[i]).append(" no button")
+                        .append(n == 0 ? "" : " (removed " + n + ")").append("; ");
+                continue;
+            }
+            // The "筛选" control is a two-view group, not one view: id/filter_dialog_enter is the
+            // label and id/filter is the icon, flush against each other as a single tap target.
+            // Anchoring on id/filter would drop the button between the word and its own icon and
+            // split the app's control in half, so the anchor is whichever of the two comes first
+            // in the row. Both are looked up among *this* copy's siblings, never window-wide.
+            int myIdx = parent.indexOfChild(filter);
+            android.view.View anchor = null;
+            for (int k = 0; k < myIdx; k++) {
+                android.view.View ck = parent.getChildAt(k);
+                if (idFilterLabel != 0 && ck.getId() == idFilterLabel) {
+                    anchor = ck;
+                    break;
+                }
+            }
+            if (anchor == null) {
+                anchor = filter;
+            }
+
+            android.view.View existing = ourChild(parent);
+            if (existing != null) {
+                if (existing.getParent() != parent) {
+                    existing = null;
+                }
+            }
+            if (existing != null) {
+                restyle(existing, label, sizeSp);
+                kept++;
+                sb.append("copy ").append(i).append(": ").append(paths[i]).append(" already has it")
+                        .append(" at ").append(absRect(existing)).append(" alpha=")
+                        .append(existing.getAlpha()).append(" color=")
+                        .append(Integer.toHexString(((android.widget.TextView) existing)
+                                .getCurrentTextColor())).append("; ");
+                continue;
+            }
+
+            android.widget.TextView b = buildButton(anchor, idSort, label, widthPx, sizeSp);
+            int at = parent.indexOfChild(anchor);
+            parent.addView(b, at, pillParams(anchor.getLayoutParams(), widthPx, b, parent));
+            b.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    Logx.i("[button] clicked");
+                    toast("BdCryptomator：保险库已识别，解锁功能将在下一阶段接入");
+                }
+            });
+            placed++;
+            sb.append("copy ").append(i).append(": ").append(paths[i]).append(" placed at at=")
+                    .append(at).append('/').append(parent.getChildCount())
+                    .append(" parent=").append(parent.getClass().getSimpleName())
+                    .append(" id=").append(idName(parent))
+                    .append(" wh=").append(parent.getWidth()).append('x').append(parent.getHeight())
+                    .append(" anchor=").append(anchor == filter ? "filter" : "filter_dialog_enter")
+                    .append("; ");
+            watchForOverflow(parent, b, why);
+        }
+
+        buttonSummary = "placed=" + placed + " kept=" + kept + " removed=" + removed
+                + " of " + copies.size() + " copy/copies of " + vaultDir;
+        armedButtons = placed + kept;
+        return buttonSummary + " " + sb + "(" + why + ")";
+    }
+
+    /** The child of {@code parent} this module injected, or null. */
+    private static android.view.View ourChild(android.view.ViewGroup parent) {
+        for (int i = 0; i < parent.getChildCount(); i++) {
+            android.view.View c = parent.getChildAt(i);
+            if (c.getTag() == TAG_UNLOCK) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    /** The last outcome already written to the log; an identical repeat is dropped. */
+    private static volatile String lastLoggedOutcome;
+
+    /**
+     * Logs {@code line} unless it repeats the previous one.
+     *
+     * <p>The listing path asks for the button once per CloudFile row, so a twenty-row directory
+     * produced twenty identical lines on every refresh and buried the rest of the module log.
+     * Suppressing exact repeats loses nothing: a change — a button finally landing, one being
+     * removed — is by definition a different line.
+     */
+    private static void logOnce(String line) {
+        if (line == null || line.equals(lastLoggedOutcome)) {
+            return;
+        }
+        lastLoggedOutcome = line;
+        Logx.i("[button] " + line);
+    }
+
+    /**
+     * A pill with hard-coded colours and radius.
+     *
+     * <p>Every visual property used to be inherited from the app's own toolbar "so it follows the
+     * theme for free". It did not: the button was measured on screen as white text on a white row,
+     * which the accessibility tree and a click handler both happily report as present. Legibility
+     * is not something to delegate to a theme whose text colour the module cannot see.
+     */
+    private static android.widget.TextView buildButton(android.view.View anchor, int idSort,
+                                                       String label, Integer widthPx,
+                                                       Integer sizeSp) {
+        Context themed = anchor.getContext() != null ? anchor.getContext() : app;
+        android.widget.TextView b = new android.widget.TextView(themed);
+        b.setTag(TAG_UNLOCK);
+        b.setText(label != null && !label.isEmpty() ? label : BUTTON_LABEL);
+        b.setSingleLine(true);
+        b.setClickable(true);
+        b.setGravity(android.view.Gravity.CENTER);
+        b.setTextColor(0xFFFFFFFF);
+        b.setAlpha(1f);
+
+        float density = themed.getResources().getDisplayMetrics().density;
+        float sizePx;
+        if (sizeSp != null) {
+            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, sizeSp.intValue());
+            sizePx = b.getTextSize();
+        } else {
+            float inherited = sortTextSizePx(anchor, idSort);
+            sizePx = inherited > 0 ? inherited
+                    : android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP,
+                            13f, themed.getResources().getDisplayMetrics());
+            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, sizePx);
+        }
+        int padX = Math.round(Math.max(sizePx * 0.7f, 10f * density));
+        b.setPadding(padX, 0, padX, 0);
+
+        // Parked on a fixed dp height rather than the anchor's, so the pill reads as a pill instead
+        // of a full-height block: the row is 30 dp and the app's own controls are ~30 dp tall.
+        int h = Math.round(26f * density);
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setShape(android.graphics.drawable.GradientDrawable.RECTANGLE);
+        g.setColor(0xFF4E6EF2);
+        g.setCornerRadius(h / 2f);
+        b.setBackground(new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(0x40FFFFFF), g, null));
+        b.setMinimumHeight(0);
+        b.setMinHeight(0);
+        return b;
+    }
+
+    /** The laid-out text size of the app's own {@code id/sort} label, or 0 when it cannot be read. */
+    private static float sortTextSizePx(android.view.View anchor, int idSort) {
+        try {
+            if (idSort == 0 || !(anchor.getParent() instanceof android.view.ViewGroup)) {
+                return 0f;
+            }
+            android.view.ViewGroup pg = (android.view.ViewGroup) anchor.getParent();
+            for (int k = 0; k < pg.getChildCount(); k++) {
+                android.view.View ck = pg.getChildAt(k);
+                if (ck.getId() == idSort && ck instanceof android.widget.TextView) {
+                    return ((android.widget.TextView) ck).getTextSize();
+                }
+            }
+        } catch (Throwable ignored) {
+            // falling back to 13 sp is fine
+        }
+        return 0f;
+    }
+
+    /** Wraps {@code b} in LayoutParams matching the parent's own type, height fixed, no weight. */
+    private static android.view.ViewGroup.LayoutParams pillParams(
+            android.view.ViewGroup.LayoutParams src, Integer widthPx, android.widget.TextView b,
+            android.view.ViewGroup parent) {
+        int w = widthPx != null ? widthPx.intValue()
+                : android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+        int h = b.getMinHeight() > 0 ? b.getMinHeight() : android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+        float density = b.getContext().getResources().getDisplayMetrics().density;
+        h = Math.round(26f * density);
+        // weight is deliberately not copied from the anchor: if the anchor were weight-sized and we
+        // copied it, an extra child would silently re-split the row and shrink the existing icons.
+        if (src instanceof android.widget.LinearLayout.LayoutParams) {
+            android.widget.LinearLayout.LayoutParams n =
+                    new android.widget.LinearLayout.LayoutParams(w, h);
+            n.gravity = android.view.Gravity.CENTER_VERTICAL;
+            n.leftMargin = Math.round(6f * density);
+            n.rightMargin = Math.round(6f * density);
+            return n;
+        }
+        if (src instanceof android.widget.FrameLayout.LayoutParams) {
+            return new android.widget.FrameLayout.LayoutParams(w, h,
+                    android.view.Gravity.CENTER_VERTICAL);
+        }
+        return new android.view.ViewGroup.LayoutParams(w, h);
+    }
+
+    /** Re-labels / re-sizes a button already in place, so the probe can restyle without a rebuild. */
+    private static void restyle(android.view.View v, String label, Integer sizeSp) {
+        if (!(v instanceof android.widget.TextView)) {
+            return;
+        }
+        android.widget.TextView t = (android.widget.TextView) v;
+        if (label != null && !label.isEmpty()) {
+            t.setText(label);
+        }
+        if (sizeSp != null) {
+            t.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, sizeSp.intValue());
+        }
+    }
+
+    /**
+     * The directory a copy of the file page is showing, as "/a/b", or null when unknowable.
+     *
+     * <p>This is the only thing that distinguishes one page from another, because the pages are
+     * otherwise identical: measured, every {@code id/filter} in the window has the same class, the
+     * same ancestors' ids and the same bounds, so geometry and view type cannot tell them apart.
+     * Only the breadcrumb can, and only if it is read from the page's own subtree.
+     *
+     * <p>Measured, the crumbs carry the drawer root as well — a page at /crypto/content reads
+     * "我的网盘/crypto/content" — so the result is matched by suffix, not equality.
+     */
+    private static String crumbPathOf(android.view.View filter, int idFilter, int idCrumb) {
+        if (idCrumb == 0) {
             return null;
         }
-        final String[] result = new String[1];
+        android.view.View page = pageRootOf(filter, idFilter, idCrumb);
+        if (page == null) {
+            return null;
+        }
+        android.view.View crumb = page.findViewById(idCrumb);
+        if (crumb == null) {
+            return null;
+        }
+        List<String> names = new ArrayList<String>();
+        collectTexts(crumb, names);
+        if (names.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String n : names) {
+            sb.append('/').append(n);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The root of the page {@code v} belongs to: the innermost ancestor that contains exactly one
+     * {@code id/rv_breadcrumb}.
+     *
+     * <p>Climbing until the <em>breadcrumb</em> count reaches one is what keeps the search inside a
+     * single page, and it is not the same rule as counting {@code id/filter}.
+     *
+     * <p>The obvious rule — climb while the ancestor holds exactly one {@code id/filter} — was
+     * measured to stop one level too low. A page carries <em>two</em> toolbars, not one: the live
+     * one inside {@code id/list_recycler_view}, and a second inside {@code id/empty_headers} that the
+     * app draws while the list is empty. Both contain an {@code id/filter}, so the enclosing
+     * {@code RelativeLayout#root} contains two, and the climb stopped at the container above the
+     * toolbar — a level that holds {@code crumbs=0}. The breadcrumb lookup then returned null for
+     * every copy, so nothing could be attributed and no button was ever placed.
+     *
+     * <p>Measured per copy, with the crumbs in place the climb terminates at
+     * {@code RelativeLayout#root} ({@code kids=13 filters=2 crumbs=1}) for both the live and the
+     * empty-state toolbar, which is exactly right: those two belong to the <em>same</em> page and
+     * must resolve to the same directory. Climbing further would reach a
+     * {@code ConstraintLayout} holding several pages at once ({@code filters=4 crumbs=2}) and
+     * {@code findViewById} from there could return another page's breadcrumb.
+     */
+    private static android.view.View pageRootOf(android.view.View v, int idFilter, int idCrumb) {
+        if (idCrumb != 0) {
+            android.view.View byCrumb = climbTo(v, idCrumb, true);
+            if (countById(byCrumb, idCrumb, 2) == 1) {
+                return byCrumb;
+            }
+        }
+        // No breadcrumb above this toolbar — another app build, or a page that has none. Fall back
+        // to the filter count, which at least stops before the ancestor holding two pages. It
+        // returns a level without crumbs, so attribution yields null and no button is placed: the
+        // honest outcome, since without a breadcrumb there is nothing to attribute a copy to.
+        return climbTo(v, idFilter, false);
+    }
+
+    /**
+     * The ancestor of {@code v} that holds exactly one view with {@code id}.
+     *
+     * <p>{@code innermost} selects which of the two, and they are genuinely different questions.
+     * Counting breadcrumbs wants the innermost level with exactly one — the smaller the subtree, the
+     * less chance {@code findViewById} wanders into a neighbouring page. Counting toolbars wants the
+     * outermost, because the toolbar itself sits in a chain of single-toolbar containers and the
+     * interesting level is the last one before the count jumps.
+     *
+     * <p>Climbing stops at the first ancestor holding two, so the returned view never spans two
+     * pages. Reads at most {@code 2} of each id, so this is O(ancestors) rather than O(tree).
+     */
+    private static android.view.View climbTo(android.view.View v, int id, boolean innermost) {
+        android.view.View last = v;
+        android.view.ViewParent p = v.getParent();
+        int guard = 0;
+        while (p instanceof android.view.ViewGroup && guard++ < 40) {
+            android.view.ViewGroup g = (android.view.ViewGroup) p;
+            int n = countById(g, id, 2);
+            if (n > 1) {
+                break;
+            }
+            if (n == 1 && innermost) {
+                return g;
+            }
+            last = g;
+            p = g.getParent();
+        }
+        return last;
+    }
+
+    /** Non-empty texts under {@code v}, depth-first, in draw order. */
+    private static void collectTexts(android.view.View v, List<String> out) {
+        if (v == null || out.size() >= 24) {
+            return;
+        }
+        if (v instanceof android.widget.TextView) {
+            CharSequence t = ((android.widget.TextView) v).getText();
+            if (t != null && t.length() > 0) {
+                out.add(t.toString().trim());
+            }
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                collectTexts(g.getChildAt(i), out);
+            }
+        }
+    }
+
+    /** Depth-first count of views with {@code id}, stopping at {@code cap}. */
+    private static int countById(android.view.View v, int id, int cap) {
+        if (v == null) {
+            return 0;
+        }
+        int n = v.getId() == id ? 1 : 0;
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount() && n < cap; i++) {
+                n += countById(g.getChildAt(i), id, cap - n);
+            }
+        }
+        return n;
+    }
+
+    /**
+     * Whether a breadcrumb path names {@code dir}.
+     *
+     * <p>A suffix test, not equality: the breadcrumb is a horizontally scrolling RecyclerView, so a
+     * deep path can be showing only its tail. "/x/content" would be a false positive against
+     * "/content", but {@code dir} is always the full path the listing reported, so a suffix match
+     * on the full string cannot be one.
+     */
+    private static boolean samePath(String path, String dir) {
+        return path != null && dir != null
+                && (path.equals(dir) || path.endsWith(dir));
+    }
+
+    /**
+     * Per-copy diagnostic: what each page copy is showing, what is in its toolbar, and every
+     * property that could make an injected button invisible.
+     *
+     * <p>Written after an accessibility dump and a screenshot disagreed: the dump reported a button
+     * at [672,393][784,476] with {@code shown=true} and a working click handler, while every pixel
+     * in that rectangle was #FFFFFF. Bounds and visibility flags cannot detect that; texture colour
+     * can, so that is what this reports.
+     */
+    public static String copiesReport(final String why) {
+        String s = onMain(new Call() {
+            @Override
+            public String run() {
+                int idFilter = app == null ? 0
+                        : app.getResources().getIdentifier("filter", "id", APP_PKG);
+                int idCrumb = app == null ? 0
+                        : app.getResources().getIdentifier("rv_breadcrumb", "id", APP_PKG);
+                java.util.List<android.view.View> copies = allCopies(idFilter);
+                if (copies.isEmpty()) {
+                    return "no id/filter copy in the window (" + why + ")";
+                }
+                StringBuilder sb = new StringBuilder("page copies: " + copies.size());
+                for (int i = 0; i < copies.size(); i++) {
+                    android.view.View filter = copies.get(i);
+                    sb.append("\ncopy ").append(i)
+                            .append(": crumb=").append(crumbPathOf(filter, idFilter, idCrumb))
+                            .append(" filter=").append(absRect(filter))
+                            .append(" vis=").append(filter.getVisibility())
+                            .append(" shown=").append(filter.isShown());
+                    // The ancestry, with the number of id/filter and id/rv_breadcrumb views in each
+                    // level. This is what decides where a page ends: stop too late and the
+                    // breadcrumb found belongs to the page next door.
+                    android.view.View cur = filter;
+                    android.view.ViewParent p = cur.getParent();
+                    for (int k = 0; cur != null && p != null && k < 9; k++) {
+                        sb.append("\ncopy ").append(i).append(" up").append(k).append(": ")
+                                .append(cur.getClass().getSimpleName())
+                                .append('#').append(idName(cur))
+                                .append(" wh=").append(cur.getWidth()).append('x').append(cur.getHeight())
+                                .append(" abs=").append(absRect(cur));
+                        if (p instanceof android.view.ViewGroup) {
+                            android.view.ViewGroup g = (android.view.ViewGroup) p;
+                            sb.append(" <- ").append(g.getClass().getSimpleName())
+                                    .append('#').append(idName(g))
+                                    .append(" idx=")
+                                    .append(g.indexOfChild(cur)).append('/').append(g.getChildCount())
+                                    .append(" z=").append(g.getZ())
+                                    .append(" filters=").append(countById(g, idFilter, 9))
+                                    .append(" crumbs=").append(countById(g, idCrumb, 9))
+                                    .append(" wh=").append(g.getWidth()).append('x').append(g.getHeight());
+                        } else {
+                            sb.append(" <- ").append(p);
+                        }
+                        cur = p instanceof android.view.View ? (android.view.View) p : null;
+                        p = cur == null ? null : cur.getParent();
+                    }
+
+                    android.view.ViewParent vp = filter.getParent();
+                    if (!(vp instanceof android.view.ViewGroup)) {
+                        sb.append("\ncopy ").append(i).append(" parent=not a ViewGroup: ").append(vp);
+                        continue;
+                    }
+                    android.view.ViewGroup pg = (android.view.ViewGroup) vp;
+                    boolean lin = pg instanceof android.widget.LinearLayout;
+                    sb.append("\ncopy ").append(i).append(" parent=")
+                            .append(pg.getClass().getSimpleName())
+                            .append('#').append(idName(pg))
+                            .append(" kids=").append(pg.getChildCount())
+                            .append(lin ? " orientation=" + ((android.widget.LinearLayout) pg)
+                                    .getOrientation() : "")
+                            .append(" wh=").append(pg.getWidth()).append('x').append(pg.getHeight())
+                            .append(" clip=").append(pg.getClipChildren())
+                            .append(" shown=").append(pg.isShown());
+                    for (int k = 0; k < pg.getChildCount(); k++) {
+                        android.view.View c = pg.getChildAt(k);
+                        android.view.ViewGroup.LayoutParams lp = c.getLayoutParams();
+                        sb.append("\ncopy ").append(i).append(" kid").append(k).append(": ")
+                                .append(c.getClass().getSimpleName())
+                                .append('#').append(idName(c))
+                                .append(" lp=").append(lp == null ? "null" : lp.width + "x" + lp.height)
+                                .append(" xy=").append(c.getLeft()).append(',').append(c.getTop())
+                                .append(" wh=").append(c.getWidth()).append('x').append(c.getHeight())
+                                .append(" alpha=").append(c.getAlpha())
+                                .append(" vis=").append(c.getVisibility())
+                                .append(" shown=").append(c.isShown());
+                        if (c instanceof android.widget.TextView) {
+                            android.widget.TextView t = (android.widget.TextView) c;
+                            sb.append(" text=").append(t.getText())
+                                    .append(" color=#").append(Integer.toHexString(t.getCurrentTextColor()))
+                                    .append(" size=").append(t.getTextSize());
+                        }
+                        sb.append(" bg=").append(c.getBackground() == null ? "none"
+                                : c.getBackground().getClass().getSimpleName())
+                                .append(" abs=").append(absRect(c));
+                        if (c.getTag() == TAG_UNLOCK) {
+                            sb.append("  <== ours");
+                        }
+                    }
+                }
+                return sb.toString();
+            }
+        }, "copies " + why);
+        // One log line per fact. LSPosed truncates long messages — the first version of this dump
+        // arrived as "…[4318 chars]" and lost exactly the child list it existed to produce.
+        int lines = 0;
+        for (String line : s.split("\n")) {
+            Logx.i("[copies] " + line);
+            lines++;
+        }
+        return "copies: " + lines + " line(s) logged (" + why + ")";
+    }
+
+    /**
+     * Runs {@code c} on the main thread and returns its answer, or a description of why not.
+     *
+     * <p>Bounded by a 4 s wait: the file list is being built and laid out while this runs, and an
+     * unbounded wait would be a way for a probe to freeze the very thread it is measuring.
+     */
+    private static String onMain(final Call c, final String what) {
+        if (app == null) {
+            return "no app context yet (" + what + ")";
+        }
+        final String[] out = new String[1];
         final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
         try {
-            boolean posted =
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+            boolean posted = new android.os.Handler(android.os.Looper.getMainLooper())
+                    .post(new Runnable() {
                         @Override
                         public void run() {
                             try {
-                                result[0] = attachUnlockButton(label, widthPx, sizeSp, why);
+                                out[0] = c.run();
                             } catch (Throwable t) {
-                                result[0] = "attach threw: " + t + " (" + why + ")";
+                                out[0] = what + " threw: " + t;
                             } finally {
                                 done.countDown();
                             }
                         }
                     });
             if (!posted) {
-                Logx.w("[button] main thread rejected the post (" + why + ")");
-                return null;
+                return "the main thread rejected " + what;
             }
         } catch (Throwable t) {
-            Logx.w("[button] cannot reach the main thread: " + t);
-            return null;
-        }
-        if (!await) {
-            return null;
+            return "cannot reach the main thread for " + what + ": " + t;
         }
         try {
             done.await(4, java.util.concurrent.TimeUnit.SECONDS);
         } catch (Throwable ignored) {
             // the caller still gets whatever was produced
         }
-        return result[0];
+        return out[0] == null ? what + " timed out" : out[0];
     }
 
-    private static String detachUnlockButton(final String why) {
-        final android.view.View b = unlockButton;
-        if (b == null) {
-            return "no unlock button was injected (" + why + ")";
+    /** A body that runs on the main thread and returns a line for the log. */
+    private interface Call {
+        String run();
+    }
+
+    private static android.app.Activity activityOf(Object fragment) {
+        Object a = fragment == null ? null : Reflectx.call0(fragment, "getActivity");
+        return a instanceof android.app.Activity ? (android.app.Activity) a : null;
+    }
+
+    private static android.view.View fragmentViewOf(Object fragment) {
+        Object v = fragment == null ? null : Reflectx.call0(fragment, "getView");
+        return v instanceof android.view.View ? (android.view.View) v : null;
+    }
+
+    /** Buttons currently attached to a drawn page copy; 0 means the retry chain keeps going. */
+    private static volatile int armedButtons;
+
+    /**
+     * Whether a retry chain is running.
+     *
+     * <p>One chain, not one per caller. The listing path asks for the button once per CloudFile row
+     * — measured at twenty rows, twenty near-simultaneous requests, all arriving before the page has
+     * settled — so a counter incremented per request would exhaust its budget on the requests rather
+     * than the retries.
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean retryInFlight =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Attempts left in the running chain; re-armed by every fresh request. */
+    private static final java.util.concurrent.atomic.AtomicInteger retryLeft =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    private static final int MAX_SHOWN_RETRIES = 40;
+
+    /**
+     * Re-attempts the insertion shortly, for the case where a listing arrives before its page has
+     * settled — the breadcrumbs still name the directory just left, or the matching copy is not laid
+     * out yet. Both resolve themselves shortly; neither justifies injecting into a copy that cannot
+     * be seen, which is what produced an invisible button in the first place.
+     *
+     * @return true when a retry is running (or was started)
+     */
+    private static boolean scheduleShownRetry(final String vaultDir, final String label,
+                                              final Integer widthPx, final Integer sizeSp,
+                                              final String why, final android.view.View pageRoot) {
+        retryLeft.set(MAX_SHOWN_RETRIES);
+        if (!retryInFlight.compareAndSet(false, true)) {
+            return true;
         }
-        final String[] out = new String[1];
-        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        postRetry(vaultDir, label, widthPx, sizeSp, why, pageRoot);
+        return true;
+    }
+
+    /** One link of the retry chain: re-posts itself until a button lands or the budget runs out. */
+    private static void postRetry(final String vaultDir, final String label, final Integer widthPx,
+                                  final Integer sizeSp, final String why,
+                                  final android.view.View pageRoot) {
         try {
-            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        android.view.ViewParent p = b.getParent();
-                        if (p instanceof android.view.ViewGroup) {
-                            ((android.view.ViewGroup) p).removeView(b);
-                            out[0] = "unlock button removed from " + p.getClass().getName()
-                                    + " (" + why + ")";
-                        } else {
-                            out[0] = "unlock button had no parent (" + why + ")";
+                        String r = attachUnlockButtons(vaultDir, label, widthPx, sizeSp, why, pageRoot);
+                        logOnce(r);
+                        // Stop as soon as a button is in place, and stop as soon as the sentence has
+                        // changed: a retry chain exists to wait for one directory's page to settle,
+                        // so once the drawn page is somewhere else the answer will never change and
+                        // the chain would only keep re-asking for ten seconds.
+                        if (armedButtons > 0 || vaultDir == null
+                                || !vaultDir.equals(lastWantedDir)) {
+                            retryInFlight.set(false);
+                            return;
                         }
                     } catch (Throwable t) {
-                        out[0] = "remove failed: " + t + " (" + why + ")";
-                    } finally {
-                        unlockButton = null;
-                        done.countDown();
+                        Logx.w("[button] retry failed: " + t);
+                    }
+                    if (retryLeft.decrementAndGet() > 0) {
+                        postRetry(vaultDir, label, widthPx, sizeSp, why, pageRoot);
+                    } else {
+                        retryInFlight.set(false);
+                        Logx.w("[button] gave up after " + MAX_SHOWN_RETRIES
+                                + " retries waiting for a drawn page of " + vaultDir + " (" + why
+                                + ")");
                     }
                 }
-            });
-            done.await(4, java.util.concurrent.TimeUnit.SECONDS);
+            }, 250);
         } catch (Throwable t) {
-            return "cannot reach the main thread: " + t;
+            retryInFlight.set(false);
+            Logx.w("[button] cannot schedule a retry: " + t);
         }
-        return out[0] == null ? "timed out removing the button" : out[0];
-    }
-
-    /**
-     * The view surgery itself. Runs on the main thread; returns a one-line outcome on every path.
-     *
-     * <p>Every visual property is inherited from the app's own toolbar rather than hard-coded: text
-     * size and colour from the sibling {@code id/sort} label, background from the theme's
-     * {@code selectableItemBackgroundBorderless}, height and margins from the anchor's own
-     * LayoutParams. The button therefore follows the app's theme — dark mode included — for free,
-     * and cannot look foreign next to the icons it sits beside. Width is the exception: it is
-     * WRAP_CONTENT so a two-character label is never clipped inside an icon-sized box.
-     *
-     * <p>{@code weight} is deliberately not copied. If the anchor were weight-sized and we copied
-     * it, an extra child would silently re-split the row and shrink the existing icons; taking the
-     * geometry while dropping the weight cannot disturb them.
-     */
-    private static String attachUnlockButton(String label, Integer widthPx, Integer sizeSp,
-                                             String why) {
-        Object frag = lastFragment;
-        if (frag == null) {
-            return "no FileTabListFragment seen yet -> open the 文件 tab first (" + why + ")";
-        }
-        Object rv = Reflectx.call0(frag, "getView");
-        Context ctx = app;
-
-        int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
-        if (idFilter == 0) {
-            return "R.id.filter is not resolvable (" + why + ")";
-        }
-        int idFilterLabel = ctx.getResources().getIdentifier("filter_dialog_enter", "id", APP_PKG);
-
-        android.view.View root = rv instanceof android.view.View ? (android.view.View) rv : null;
-        android.view.View filter = root == null ? null : root.findViewById(idFilter);
-        String via = "fragment view";
-        if (filter == null) {
-            // getView() is null or stale for a moment after the fragment is recreated. The host
-            // activity's decor view holds the same toolbar and is never stale, so look there
-            // instead of waiting for another navigation.
-            Object act = Reflectx.call0(frag, "getActivity");
-            if (act instanceof android.app.Activity) {
-                android.view.Window w = ((android.app.Activity) act).getWindow();
-                android.view.View decor = w == null ? null : w.getDecorView();
-                filter = decor == null ? null : decor.findViewById(idFilter);
-                if (filter != null) {
-                    root = decor;
-                    via = "host activity decor view";
-                }
-            }
-        }
-        if (filter == null || root == null) {
-            return "id/filter is not in the current file page view (" + why + ")";
-        }
-
-        // The "筛选" control is a two-view group, not one view: id/filter_dialog_enter is the label
-        // and id/filter is the icon, and the live tree measures them flush against each other (0 px
-        // apart) as a single tap target. Anchoring on id/filter would drop the button between the
-        // word and its own icon and split the app's control in half, so the anchor is whichever of
-        // the two comes first in the row.
-        android.view.View anchor = filter;
-        if (idFilterLabel != 0) {
-            android.view.View lbl = root.findViewById(idFilterLabel);
-            android.view.ViewParent lp0 = lbl == null ? null : lbl.getParent();
-            if (lp0 != null && lp0 == filter.getParent() && lp0 instanceof android.view.ViewGroup) {
-                android.view.ViewGroup g = (android.view.ViewGroup) lp0;
-                if (g.indexOfChild(lbl) < g.indexOfChild(filter)) {
-                    anchor = lbl;
-                }
-            }
-        }
-
-        android.view.View existing = unlockButton;
-        if (existing != null && existing.getParent() == anchor.getParent()) {
-            return "unlock button is already in place (" + why + ")";
-        }
-        android.view.ViewParent vp = anchor.getParent();
-        if (!(vp instanceof android.view.ViewGroup)) {
-            return "id/" + (anchor == filter ? "filter" : "filter_dialog_enter")
-                    + " has no ViewGroup parent (" + why + ")";
-        }
-        android.view.ViewGroup parent = (android.view.ViewGroup) vp;
-
-        Context themed = anchor.getContext() != null ? anchor.getContext() : ctx;
-        android.widget.TextView b = new android.widget.TextView(themed);
-        b.setText(label != null && !label.isEmpty() ? label : BUTTON_LABEL);
-        b.setSingleLine(true);
-        b.setClickable(true);
-        b.setGravity(android.view.Gravity.CENTER);
-
-        android.widget.TextView sort = null;
-        int idSort = ctx.getResources().getIdentifier("sort", "id", APP_PKG);
-        if (idSort != 0) {
-            android.view.View v = root.findViewById(idSort);
-            if (v instanceof android.widget.TextView) {
-                sort = (android.widget.TextView) v;
-            }
-        }
-        if (sort != null) {
-            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, sort.getTextSize());
-            b.setTextColor(sort.getCurrentTextColor());
-        } else {
-            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f);
-        }
-        if (sizeSp != null) {
-            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, sizeSp.intValue());
-        }
-        int padX = Math.round(b.getTextSize() * 0.6f);
-        b.setPadding(padX, 0, padX, 0);
-        try {
-            android.util.TypedValue attr = new android.util.TypedValue();
-            if (themed.getTheme().resolveAttribute(
-                    android.R.attr.selectableItemBackgroundBorderless, attr, true)
-                    && attr.resourceId != 0) {
-                b.setBackgroundResource(attr.resourceId);
-            }
-        } catch (Throwable ignored) {
-            // purely cosmetic: a missing ripple must not stop the button from working
-        }
-
-        android.view.ViewGroup.LayoutParams src = anchor.getLayoutParams();
-        android.view.ViewGroup.LayoutParams lp;
-        int srcH = src == null ? android.view.ViewGroup.LayoutParams.MATCH_PARENT : src.height;
-        if (srcH <= 0) {
-            srcH = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
-        }
-        // Width is WRAP_CONTENT by default and is deliberately NOT copied from the anchor. The
-        // anchor is an icon-sized view (id/filter measures 86 px wide), and a two-character label
-        // would be clipped inside that; the row has ~557 px of slack between the sort cluster and
-        // this one, so letting the label size itself costs nothing.
-        final int w = widthPx != null ? widthPx.intValue()
-                : android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
-        final int h = srcH;
-        if (src instanceof android.widget.LinearLayout.LayoutParams) {
-            android.widget.LinearLayout.LayoutParams s =
-                    (android.widget.LinearLayout.LayoutParams) src;
-            android.widget.LinearLayout.LayoutParams n =
-                    new android.widget.LinearLayout.LayoutParams(w, h);
-            n.gravity = s.gravity;
-            n.topMargin = s.topMargin;
-            n.bottomMargin = s.bottomMargin;
-            n.leftMargin = s.leftMargin;
-            n.rightMargin = s.rightMargin;
-            lp = n;
-        } else if (src instanceof android.widget.FrameLayout.LayoutParams) {
-            android.widget.FrameLayout.LayoutParams s =
-                    (android.widget.FrameLayout.LayoutParams) src;
-            lp = new android.widget.FrameLayout.LayoutParams(w, h, s.gravity);
-        } else {
-            lp = new android.view.ViewGroup.LayoutParams(w, h);
-        }
-
-        int at = parent.indexOfChild(anchor);
-        parent.addView(b, at, lp);
-        unlockButton = b;
-        watchForOverflow(parent, b, why);
-
-        b.setOnClickListener(new android.view.View.OnClickListener() {
-            @Override
-            public void onClick(android.view.View v) {
-                Logx.i("[button] clicked");
-                toast("BdCryptomator：保险库已识别，解锁功能将在下一阶段接入");
-            }
-        });
-
-        StringBuilder sb = new StringBuilder("unlock button inserted into ");
-        sb.append(parent.getClass().getName()).append(" id=").append(idName(parent))
-                .append(" index=").append(at).append('/').append(parent.getChildCount())
-                .append(" lp=").append(lp.getClass().getSimpleName())
-                .append('(').append(lp.width).append('x').append(lp.height).append(')')
-                .append(" parent=").append(parent.getWidth()).append('x').append(parent.getHeight())
-                .append(" text=").append(b.getText())
-                .append(" anchor=").append(anchor == filter ? "filter" : "filter_dialog_enter")
-                .append(" via=").append(via)
-                .append(" why=").append(why);
-        android.view.ViewParent up = parent.getParent();
-        if (up instanceof android.view.View) {
-            sb.append(" grandparent=").append(up.getClass().getSimpleName())
-                    .append(" id=").append(idName((android.view.View) up));
-        }
-        return sb.toString();
     }
 
     /**
@@ -1073,8 +1826,10 @@ public final class Hooks {
                                         return;
                                     }
                                 }
-                                Logx.i("[button] fits: row laid out within " + limit
-                                        + " px, everything left of the edge (" + why + ")");
+                                Logx.i("[button] placed: at " + absRect(self) + " shown="
+                                        + self.isShown() + " w=" + self.getWidth() + " in a "
+                                        + limit + " px row, everything left of the edge (" + why
+                                        + ")");
                             } catch (Throwable t) {
                                 Logx.w("[button] overflow check failed: " + t);
                             }
@@ -1116,45 +1871,50 @@ public final class Hooks {
     /** @return the measurement, or null when it cannot be taken so the caller can retry later. */
     private static String buildToolbarTree(String why) {
         try {
-            Object f = lastFragment;
-            if (f == null) {
-                Logx.w("[toolbar] no fragment yet; will retry on next resume");
-                return null;
-            }
-            Object rv = Reflectx.call0(f, "getView");
-            if (!(rv instanceof android.view.View)) {
-                Logx.w("[toolbar] fragment view not available");
-                return null;
-            }
-            android.view.View root = (android.view.View) rv;
-            int id = app == null ? -1 : app.getResources().getIdentifier("filter", "id", APP_PKG);
-            if (id == -1) {
+            int id = app == null ? 0 : app.getResources().getIdentifier("filter", "id", APP_PKG);
+            if (id == 0) {
                 Logx.w("[toolbar] R.id.filter not resolvable");
                 return null;
             }
-            android.view.View v = root.findViewById(id);
+            Object f = lastFragment;
+            Object actObj = f == null ? null : Reflectx.call0(f, "getActivity");
+            android.app.Activity act = actObj instanceof android.app.Activity
+                    ? (android.app.Activity) actObj : null;
+
+            android.view.View v = findShownById(act, id);
+            String how = "the shown copy";
+            if (v == null && f != null) {
+                Object rv = Reflectx.call0(f, "getView");
+                if (rv instanceof android.view.View) {
+                    v = ((android.view.View) rv).findViewById(id);
+                    how = "a fragment copy (nothing is shown)";
+                }
+            }
             if (v == null) {
-                Logx.w("[toolbar] id/filter not under the fragment view");
+                Logx.w("[toolbar] no id/filter anywhere yet; will retry");
                 return null;
             }
 
-            StringBuilder sb = new StringBuilder("[toolbar] view chain of id/filter (")
-                    .append(why).append(")\n");
+            // One log line per view, deliberately not one big string: LSPosed truncates long
+            // messages, and a single dump arrived here as "…[4792 chars]" — the first attempt at
+            // this measurement lost the very child list it existed to obtain.
+            Logx.i("[toolbar] id/filter via " + how + " (" + why + ")");
             android.view.View cur = v;
-            for (int i = 0; cur != null && i < 8; i++) {
+            for (int i = 0; cur != null && i < 6; i++) {
                 android.view.ViewGroup.LayoutParams lp = cur.getLayoutParams();
-                sb.append("  [").append(i).append("] ").append(cur.getClass().getName())
-                        .append(" id=").append(idName(cur))
-                        .append(" lp=").append(lp == null ? "null"
+                Logx.i("[toolbar] [" + i + "] " + cur.getClass().getName()
+                        + " id=" + idName(cur)
+                        + " lp=" + (lp == null ? "null"
                                 : lp.getClass().getSimpleName() + "(" + lp.width + "x" + lp.height + ")")
-                        .append(" xy=").append((int) cur.getX()).append(',').append((int) cur.getY())
-                        .append(" wh=").append(cur.getWidth()).append('x').append(cur.getHeight())
-                        .append(" vis=").append(cur.getVisibility())
-                        .append('\n');
+                        + " xy=" + (int) cur.getX() + "," + (int) cur.getY()
+                        + " wh=" + cur.getWidth() + "x" + cur.getHeight()
+                        + " vis=" + cur.getVisibility() + " shown=" + cur.isShown()
+                        + " abs=" + absRect(cur));
                 android.view.ViewParent p = cur.getParent();
                 if (p instanceof android.view.ViewGroup) {
                     android.view.ViewGroup g = (android.view.ViewGroup) p;
-                    sb.append("      parent=").append(g.getClass().getName())
+                    StringBuilder sb = new StringBuilder("[toolbar]    parent=")
+                            .append(g.getClass().getName())
                             .append(" id=").append(idName(g))
                             .append(" children=").append(g.getChildCount())
                             .append(" myIndex=").append(g.indexOfChild(cur));
@@ -1164,29 +1924,96 @@ public final class Hooks {
                     }
                     if (g instanceof android.view.View) {
                         android.view.View gv = (android.view.View) g;
-                        sb.append(" wh=").append(gv.getWidth()).append('x').append(gv.getHeight());
-                        sb.append(" vis=").append(gv.getVisibility());
+                        sb.append(" wh=").append(gv.getWidth()).append('x').append(gv.getHeight())
+                                .append(" vis=").append(gv.getVisibility())
+                                .append(" shown=").append(gv.isShown());
                     }
-                    sb.append('\n');
+                    Logx.i(sb.toString());
                     for (int k = 0; k < g.getChildCount(); k++) {
                         android.view.View ck = g.getChildAt(k);
                         android.view.ViewGroup.LayoutParams klp = ck.getLayoutParams();
-                        sb.append("        ").append(k).append(": ")
-                                .append(ck.getClass().getSimpleName())
-                                .append(" id=").append(idName(ck))
-                                .append(" lp=").append(klp == null ? "null"
+                        Logx.i("[toolbar]      " + k + ": "
+                                + ck.getClass().getSimpleName()
+                                + " id=" + idName(ck)
+                                + " lp=" + (klp == null ? "null"
                                         : klp.getClass().getSimpleName()
                                                 + "(" + klp.width + "x" + klp.height + ")")
-                                .append('\n');
+                                + " w=" + ck.getWidth()
+                                + " shown=" + ck.isShown()
+                                + " abs=" + absRect(ck));
                     }
                 }
                 cur = (p instanceof android.view.View) ? (android.view.View) p : null;
             }
-            return sb.toString();
+            return "[toolbar] measured via " + how + " (" + why + ")";
         } catch (Throwable t) {
             Logx.w("[toolbar] dump failed: " + t);
             return null;
         }
+    }
+
+    /** Every view with the given id under {@code v}, depth-first, in draw order. */
+    private static void collectById(android.view.View v, int id,
+                                    java.util.List<android.view.View> out) {
+        if (v == null || out.size() >= 64) {
+            return;
+        }
+        if (v.getId() == id) {
+            out.add(v);
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                collectById(g.getChildAt(i), id, out);
+            }
+        }
+    }
+
+    /**
+     * The copy of {@code id} that is actually on screen, or null when none is.
+     *
+     * <p>There is usually more than one: the connection between two file pages stays alive, so the
+     * previous directory's toolbar is still attached. Copies are searched from the end because
+     * later siblings draw on top, which makes the last one the visible one. The single rule lives
+     * here so the button and the diagnostic dump cannot disagree about which toolbar is real.
+     */
+    private static android.view.View findShownById(android.app.Activity act, int id) {
+        if (act == null || id == 0) {
+            return null;
+        }
+        android.view.Window w = act.getWindow();
+        java.util.List<android.view.View> copies = new java.util.ArrayList<android.view.View>();
+        collectById(w == null ? null : w.getDecorView(), id, copies);
+        for (int i = copies.size() - 1; i >= 0; i--) {
+            android.view.View c = copies.get(i);
+            if (!c.isShown()) {
+                continue;
+            }
+            android.graphics.Rect r = new android.graphics.Rect();
+            if (c.getGlobalVisibleRect(r) && r.width() > 0 && r.height() > 0) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The part of {@code v} that is on screen, as {@code l,t-r,b}, or "none".
+     *
+     * <p>Absolute bounds, unlike {@code getLeft()}. A view inside the previous directory's retained
+     * page reports perfectly ordinary left/right values while sitting nowhere near the screen,
+     * which is exactly the trap that hid the first version of the unlock button.
+     */
+    private static String absRect(android.view.View v) {
+        try {
+            android.graphics.Rect r = new android.graphics.Rect();
+            if (v.getGlobalVisibleRect(r)) {
+                return r.left + "," + r.top + "-" + r.right + "," + r.bottom;
+            }
+        } catch (Throwable ignored) {
+            // a view that cannot report a rect is reported as "none" below
+        }
+        return "none";
     }
 
     private static String idName(android.view.View v) {
@@ -1257,9 +2084,7 @@ public final class Hooks {
                 + "\n  urls        : " + urls.size()
                 + "\n  vaults      : " + vaultsAnnounced
                 + "\n  vault dirs  : " + vaultDirs
-                + "\n  button      : " + (unlockButton == null
-                        ? "not injected"
-                        : (unlockButton.getParent() == null ? "detached" : "in the toolbar"))
+                + "\n  button      : " + buttonSummary
                 + "\n  missing     : " + missingTargets;
     }
 

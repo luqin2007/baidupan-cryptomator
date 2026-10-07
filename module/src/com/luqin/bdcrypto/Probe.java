@@ -83,6 +83,8 @@ public final class Probe {
             Logx.i(Hooks.toolbarTreeNow());
         } else if ("btn".equals(cmd)) {
             Logx.i(Hooks.buttonCommand(arg));
+        } else if ("copies".equals(cmd)) {
+            Logx.i(Hooks.copiesReport("probe"));
         } else {
             Logx.w("unknown cmd: " + cmd);
             help();
@@ -101,8 +103,10 @@ public final class Probe {
                 + "  columns                   distinct Cursor column-name sets seen\n"
                 + "  net                       HTTP URLs observed\n"
                 + "  tree                      measure the toolbar view tree around id/filter, again\n"
+                + "  copies                    every page copy in the window: what it is showing, what\n"
+                + "                              is in its toolbar, and the colour/alpha of each child\n"
                 + "  btn [args]                inject / style / remove the unlock button\n"
-                + "                              off | text=<label> | w=<px> | size=<sp>\n"
+                + "                              off | diag | text=<label> | w=<px> | size=<sp>\n"
                 + "  state                     one-line summary of what has been captured\n"
                 + "  ls | clear                list / delete probe report files");
     }

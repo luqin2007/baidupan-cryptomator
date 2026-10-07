@@ -310,3 +310,234 @@ CloudP2pDlinkApi
 `IDownloadable` 的方法名是干净的（`getFileDlink` / `getFilePath` / `getFileId`），
 且 `CloudFile` 实现了它 —— 所以"给定一个 CloudFile，让 App 自己去下载"这条路有明确入口。
 P0-B 的判断留给下一版的运行时调用图。
+
+## 9. 工具栏副本的真实结构（2026-10-07 深夜，`copies` 探针实测）
+
+§8.2 只说了"工具栏是列表 header"，不够。探针把窗口里**每一个** `id/filter` 连它的祖先链
+逐层打印之后，真相是：
+
+**一次 `/crypto/content` 的列表面板，窗口里有 4 个 `id/filter`、3 个页面容器、2 个面包屑。**
+
+```
+ConstraintLayout (kids=3  filters=4  crumbs=2)          ← 页面容器们的公共父
+├── FrameLayout#filelist_container3 ... SwipeBackLayout → RelativeLayout#root (kids=13 filters=2 crumbs=1)
+│     ├── FileListRecyclerView#list_recycler_view → LinearLayout#container → … → UISVGView#filter   shown=false
+│     └── UILinearLayout#empty_headers            → LinearLayout#container → … → UISVGView#filter   shown=false
+└── FrameLayout#filelist_container2 ... SwipeBackLayout → RelativeLayout#root (kids=13 filters=2 crumbs=1)
+      ├── FileListRecyclerView#list_recycler_view → LinearLayout#container → … → UISVGView#filter   shown=true   ← 在屏的那份
+      └── UILinearLayout#empty_headers            → LinearLayout#container → … → UISVGView#filter   shown=false
+```
+
+### 9.1 一页有两套工具栏，不是一套
+
+`list_recycler_view` 里那套是列表非空时用的；`empty_headers` 里还有一套同构的，
+列表为空时显示。两套都带完整的 `sort / filter_dialog_enter / filter`，
+且**两套都属于同一页**（同一个 `RelativeLayout#root`，`crumbs=1`）。
+
+后果：任何"数这一层有几个 `id/filter`"的规则都会把一页当成两页。
+`pageRootOf` 最初写成"爬到第一个含 ≥2 个 `id/filter` 的祖先之前停下"，
+于是在 `list_view_bg_layout` / `empty_headers` 就停了 —— 而这两层 `crumbs=0`，
+`findViewById(rv_breadcrumb)` **永远返回 null**，四份副本全部无法归属，按钮一次都没插进去。
+
+**正确规则**：页根 = **最内层**"恰含 1 个 `id/rv_breadcrumb`"的祖先。
+实测它正好落在 `RelativeLayout#root`，两套工具栏都归到同一页，正是想要的语义。
+再往上爬会碰到那个 `filters=4 crumbs=2` 的 `ConstraintLayout`，
+从那里 `findViewById` 就可能取到隔壁页的面包屑。
+
+### 9.2 面包屑是唯一的区分手段
+
+四份副本的 class、各级祖先的资源 id、bounds **全部相同**，几何和类型都分不出来。
+只有 `rv_breadcrumb` 里的文字能说它是哪一页：
+
+```
+copy 0 / copy 1 : crumb = /crypto          ← filelist_container3
+copy 2 / copy 3 : crumb = /crypto/content  ← filelist_container2（copy 2 shown=true）
+```
+
+`rv_breadcrumb` 是 `RecyclerView`，item 结构 `LinearLayout → TextView#content`，
+文字是目录名。注意它**带上抽屉根节点**：`/crypto/content` 这一页读到的是
+`我的网盘/crypto/content`（三个 item），所以匹配用后缀不能用相等。
+
+### 9.3 `isShown()` 只能滤掉空态工具栏，判断不了哪一页画在屏上
+
+这一条是 §9.2 之后的第一次修正，**它自己后来又被 §9.4 修正了一次**。
+
+同页两套工具栏 crumb 相同、都"匹配"，但 `empty_headers` 那套 `shown=false`、`w=0`。
+把按钮放进去就是这个模块踩得最久的坑：**树里有、`clickable=true`、
+`uiautomator` 里查得到，但屏幕上什么都没有**。所以"归属对了"还不够，必须再筛一次
+`isShown()` —— 这一步是对的，至今仍在用（`attachUnlockButtons` 里对 `isTarget[]` 的第二次扫描）。
+
+**但它只够滤掉空态工具栏，不够定位"当前页"。** 反例（`copies` 探针，从
+`/crypto/content` 退回 `/crypto` 的稳定态）：
+
+```
+copy 0: crumb=/crypto          filter_layout shown=true   ← filelist_container3
+copy 1: crumb=/crypto          shown=false                ← empty_headers in container3
+copy 2: crumb=/crypto/content  filter_layout shown=true   ← filelist_container2
+copy 3: crumb=/crypto/content  shown=false                ← empty_headers in container2
+```
+
+`copy 0` 与 `copy 2` **同时 `shown=true`**，因为它们都是 `VISIBLE` 且 attached 的，
+只是一个被另一个画在了上面。`RecyclerView` 之外根本没有"这块被遮住了"的状态可读。
+
+后果（真实发生过）：`reconcile` 第一版"取第一个 `isShown()` 的副本"，
+于是永远取到 `copy 0` = `/crypto`，判成"当前页不是保险库" → 刚插上的按钮立刻被扫掉，
+表现为 **按钮怎么也不出现**。
+
+### 9.4 绘制顺序 = 子索引顺序，最后一个 drawn 的副本才是当前页
+
+判据不在 `isShown()` 里，在**父容器的子列表顺序**里。实测：
+app 把当前页的容器**移到它父容器子列表的末尾** ——
+`filelist_container3` 在过渡期报 `idx=2/3`，稳定后又报 `idx=1/3`；
+而一个 `ViewGroup` 里**后置的子视图画在前置之上**，深度优先遍历又是按子索引走的。
+
+所以：**从后往前遍历副本，第一个 `isShown()` 且 crumb 可读的，就是绘制页。**
+`copies` 探针为了支持这个判断，在祖先链里加了 `idx=<i>/<n> z=<z>`
+（`indexOfChild` / `getZ`）。
+
+```java
+for (int i = copies.size() - 1; i >= 0; i--) {   // 后遍历者画在上层
+    android.view.View f = copies.get(i);
+    if (!f.isShown()) continue;
+    String crumb = crumbPathOf(f, idFilter, idCrumb);
+    if (crumb != null) { drawn = crumb; drawnCopy = f; break; }
+}
+```
+
+`z` 顺带确认了用 `getZ()` 判层级在这套布局里**不成立**：几份副本的 `z` 相同（都是 0），
+所以只有 `indexOfChild` 能区分。
+
+### 9.5 走出保险库目录不会触发任何回调 —— 触发点只能是面包屑
+
+`detectVault` 只在**看到** `vault.cryptomator` / `masterkey.cryptomator` 时被调用。
+用户从 `/crypto/content` 按返回键到 `/crypto`，新目录不是保险库，
+**没有任何代码路径会再去管那个按钮** —— 实测它就一直留在窗口里
+（`[641,398][767,470]`，离屏不可见，但 `uiautomator` 里还在）。
+
+关键是：**这个方向连 `detectVault` 都不会被叫到**，两条看起来存在的触发路径实测都断了：
+
+| 本来指望的触发 | 实测结果 |
+|---|---|
+| 行路径（`CloudFile` 构造）→ `detectVault` | 退回 `/crypto/content` **没有任何新 `CloudFile`** —— 列表走缓存，行不重建，识别不触发 |
+| fragment 生命周期（`onResume` 等） | 退回时**没有任何 fragment 事件** —— 页面 view 被保留，只是换了数据源 |
+
+唯一每次都变的是**面包屑**：它的 item 正文就是目录名。
+所以 P1 的行路径触发（`noteListingDir` / `dirOf(path)` + 延迟 300 ms 清扫）**整体删除**，
+换成 hook `com.baidu.netdisk.ui.breadcrumb.BreadcrumbAdapter#onBindViewHolder` 驱动的
+对账（§9.7）。hook 类而不是实例，因为每个文件页都会 `setAdapter` 一个新的，
+hook 类才能覆盖后面才建出来的页。
+
+延迟仍然必要（现在是 250 ms，去抖）：到达一个目录时，
+面包屑 rebind、第一条 `CloudFile`、fragment resume 会**几乎同时**打过来，
+而此刻 app 还在换页，抢第一个会读到**正在离开的那一页**的面包屑。
+
+### 9.6 同一目录可能有两页都 `shown=true` —— 必须按"页根"限幅，否则插出两颗按钮
+
+实测（`/crypto/content` 退回后的某个瞬间）：4 份副本**全部** crumb=`/crypto/content`，
+其中 `copy 0`（`container3`）与 `copy 2`（`container2`）**都 `shown=true`**。
+它们属于**两个不同的页面容器**，只是碰巧在显示同一个目录。
+不加约束就会给两份都插按钮 —— 同一坐标两颗，一颗盖住另一颗，
+树里 `解锁=2`，点下去命中哪个不可控。
+
+判据是**页根**（§9.1 的定义：最内层恰含 1 个 `rv_breadcrumb` 的祖先）。
+`attachUnlockButtons` 因此多了一个 `pageRoot` 参数，只对"与绘制页同根"的副本动手：
+
+```java
+boolean mine = pageRoot == null
+        || pageRootOf(copies.get(i), idFilter, idCrumb) == pageRoot;
+```
+
+### 9.7 对账（reconcile）：按钮的全部状态由"绘制页的面包屑"推导
+
+这是 P1 收敛到的架构，`Hooks.reconcile(why)` 是唯一的写入口。
+
+放弃"事件流驱动"不是风格选择，是 §9.5 的实测逼出来的：事件两个方向都不可靠。
+既然如此，就不要让按钮状态散落在事件之间，改成**每次从一个始终可读的事实重新推导**：
+
+```
+绘制页的面包屑 → 它是不是保险库目录？
+  ├─ 是 → 只在该页同根、且 isShown 的副本上放按钮（其余副本撤掉）
+  └─ 否 → 窗口里所有副本上的自有按钮全部撤掉
+```
+
+几个实现要点：
+
+- **身份挂在 view 上，不记引用。** 注入的子视图都打 `TAG_UNLOCK`，
+  "这个工具栏有没有按钮"直接问工具栏自己。旧的 `volatile View unlockButton`
+  单引用被删掉：一份窗口里有 4 个 `id/filter`、分属 3 个页面容器，
+  单个引用在大多数时候描述的都是错的那一份。
+- **`sweepAllOurButtons` 清全部副本，不只清绘制页。** 只是"停止被列出"的页仍在窗口里，
+  留在它身上的按钮会在 app 把那页拿回来时**复活**。
+- **`reconcileSoon` 去抖。** 一个 `AtomicBoolean` pending 标志，触发点只有两个：
+  面包屑 `onBindViewHolder`、fragment `onViewCreated|onResume`。一个待处理 pass 足够 ——
+  后来的触发只是把它往后挪，pass 本身会重新从树里读一遍。
+- **重试链只为"等这一页安定"。** `armedButtons`（当前按钮数）、`lastWantedDir`
+  （这次要的是哪个目录）、`retryInFlight`/`retryLeft`（`MAX_SHOWN_RETRIES = 40`）。
+  一旦绘制页换成别的目录，这条问题就没有答案了，链自己停。
+- **日志去重。** `lastLoggedOutcome` + `logOnce`，避免 40 次重试刷出 40 行一样的字。
+
+`btn off` 与 `btn diag`（= `copies` 探针）都直接走这套，见 §10。
+
+### 9.8 附带发现：版本号在清单里硬编码会静默生效
+
+见 §8 之外的独立提交。`aapt2` 的 `--version-code/--version-name`
+**只在清单没声明时**才生效；清单里写了就静默忽略命令行的值。
+三个构建全部自称 `0.1.0-p0`，也是"模块更新后不重载"的一部分原因。
+现在 `build.sh` 会用 `aapt2 dump badging` 读回链接产物并断言，不符即 `die`。
+
+## 10. 探针命令与 P1 回归（`0.9.1-p1`）
+
+观测通道见 §8.1，命令通过广播下发：
+
+```bash
+adb shell am broadcast -a com.luqin.bdcrypto.PROBE --es cmd <cmd> [--es arg <arg>]
+```
+
+`copies`（= `btn diag`）是本轮新加的，也是 §9 全部结论的来源。
+它按**绘制顺序的逆序**列出窗口里每一份 `id/filter`：
+
+```
+copy 2: <class> shown=true  crumb=/crypto/content  parent=<class> id=filter_layout wh=174x83
+        chain: ... idx=2/3 z=0.0 ...
+        children of parent: [id=sort] [id=filter_dialog_enter] [id=filter] [OURS id=? wh=126x72]
+        <含 button 时的：absolute rect / alpha / 文字色>
+```
+
+为了判定绘制顺序，祖先链里带 `idx=<i>/<n>` 与 `z=<z>`（`indexOfChild` / `getZ`）——
+就是 §9.4 那条结论的证据形状。`btn` 新增 `diag` 子命令（等价于 `copies`），
+`off` 现在会清**全部**副本（§9.7）。
+
+**P1 回归（真机，`0.9.1-p1` / versionCode 13）** 是四步走位 + 一次点击，
+每步用 `uiautomator dump` 数 `解锁` 节点数、并对原按钮位取均色验证可见性：
+
+| 步 | 走位 | 面包屑实测 | `解锁` 数 | 原按钮位均色 |
+|---|---|---|---|---|
+| A | 打开 / 切回文件页，停在 `/crypto/content` | `[['crypto','content'], ['crypto']]` | 1 | `[107,133,244]`（蓝，可见） |
+| B | 进入 `/crypto/content/d` | `[['crypto','content','d'], ['crypto','content']]` | 0 | — |
+| C | 退回 `/crypto/content` | `[['crypto','content'], ['crypto','content']]` | 1 | `[107,133,244]` |
+| D | 退到 `/crypto` | `[['crypto']]` | 0 | `[255,255,255]`（白，已撤净） |
+| E | 点按钮 | — | — | Toast：`BdCryptomator：保险库已识别，解锁功能将在下一阶段接入` |
+
+C 步是本轮架构的关键验证：**面包屑数组两个元素内容相同**
+（`copy 0` 与 `copy 2` 都在 `/crypto/content`），
+正是 §9.6 那个"两页显示同一目录"的场景 —— 靠页根限幅才把 `解锁` 数压回 1。
+A/B/D 三步验证 §9.5 的清扫：进目录、退到非保险库目录，
+按钮都在 250 ms 对账后消失且**不复活**。
+
+对应日志（LSPosed 模块日志，一行一事实）：
+
+```
+[button] placed=1 kept=0 removed=0 of 2 copy/copies of /crypto/content
+  copy 0: /crypto/content placed at at=4/8 parent=LinearLayout id=filter_layout wh=174x83
+    anchor=filter_dialog_enter; copy 1: /crypto/content no button;
+  (breadcrumb bound, drawn page is /crypto/content)
+[button] placed: at 641,398-767,470 shown=true w=126 in a 334 px row
+[button] swept a button off /crypto/content, which is not /crypto/content/d
+```
+
+`anchor=filter_dialog_enter` 说明按钮锚在"筛选"**整组控件的第一个成员**之前，
+而不是夹在文字与它自己的图标之间（§8.2 的后续修正）。
+
+P1 到此为止：按钮的出现、消失、不重复、位置、点击回调全部有实测支撑。
+下一步是 P0-B 内容读取通道（读 `vault.cryptomator` 全文），见 §7 的剩余目标。
+
