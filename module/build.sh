@@ -19,7 +19,7 @@ set -euo pipefail
 
 # ---------------------------------------------------------------- version ---
 VERSION_CODE="${VERSION_CODE:-1}"
-VERSION_NAME="${VERSION_NAME:-0.1.0}"
+VERSION_NAME="${VERSION_NAME:-0.1.0-p0}"
 
 # ------------------------------------------------------------ toolchain ----
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -191,6 +191,9 @@ if [ -f "$KS_PROPS" ]; then
     [ -n "$KS_PASS" ] || die "storePassword missing in keystore.properties"
 else
     echo "    keystore.properties not found -> falling back to a debug key"
+    echo "    !! WARNING: a debug-signed APK installs fine but can NEVER update a"
+    echo "    !! release-signed one (INSTALL_FAILED_UPDATE_INCOMPATIBLE). Do not"
+    echo "    !! publish the result as a release; see module/tools/README-signing.md."
     KS="$MODULE_DIR/keystore/debug.keystore"
     KS_PASS="android"; KEY_PASS="android"; KS_ALIAS="androiddebugkey"
     SIGN_MODE="debug"

@@ -168,6 +168,24 @@ adb logcat -s BDCrypto:V
 
 看到 `=== BdCryptomator attached: pkg=com.baidu.drive.app ... ===` 就说明模块活了。
 
+### 7.1 校验下载的 APK
+
+发布件用固定的正式密钥签名（RSA-4096 / SHA256withRSA）。装之前请核对指纹，确认拿到的是本仓库的构建：
+
+| 项 | 值 |
+|---|---|
+| 证书 SHA-256 | `9A:34:AD:E0:AC:34:FC:87:8B:89:AC:31:AA:16:B2:C7:6C:F8:02:3B:E7:AF:48:A2:3C:F1:03:0F:B2:1F:31:ED` |
+| 证书 SHA-1 | `DD:E8:B7:04:BF:40:12:06:FB:2D:5C:A7:14:BD:84:E8:A0:A0:6B:E5` |
+
+```bash
+apksigner verify --print-certs BdCryptomator-<version>.apk | grep SHA-256
+sha256sum BdCryptomator-<version>.apk     # 与 release notes 里的值比对
+```
+
+> ⚠️ 签名私钥不在仓库里（`module/keystore/` 被 `.gitignore` 挡住），细节见
+> [`module/tools/README-signing.md`](module/tools/README-signing.md)。
+> **先装过 debug 签名版本的话，必须先卸载**才能装正式签名版。
+
 ---
 
 ## 8. 运行时探针（开发用）
