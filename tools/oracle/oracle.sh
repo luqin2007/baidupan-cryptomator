@@ -10,6 +10,11 @@
 #                                                 only mode that can speak about an entry that is not
 #                                                 in a local vault — which is exactly the situation
 #                                                 when checking a row the phone just rewrote.
+#   oracle.sh hash   <vaultDir> <passphrase> <dirId>...
+#                                                 where a directory's entries actually live:
+#                                                 dirId -> d/XY/<rest>. The join that cannot be
+#                                                 guessed from the listing, because the folder name
+#                                                 is one-way in the id.
 #
 # Why this exists: the module must implement Cryptomator's directory traversal itself (it cannot
 # ship cryptofs — that needs java.nio.file, guava, jackson and a local filesystem). These programs
@@ -63,9 +68,9 @@ echo "mods : $MODS"
 
 "$JAVA_HOME/bin/javac.exe" -nowarn -cp "$MODS_WIN" -d "$BUILD_WIN" \
     "$HERE_WIN/CheckPass.java" "$HERE_WIN/Unlock.java" "$HERE_WIN/MakeVault.java" \
-    "$HERE_WIN/NameDec.java" || exit 1
+    "$HERE_WIN/NameDec.java" "$HERE_WIN/DirHash.java" || exit 1
 
-mode="${1:?usage: oracle.sh check|unlock|make|name <vaultDir> <passphrase>}"
+mode="${1:?usage: oracle.sh check|unlock|make|name|hash <vaultDir> <passphrase>}"
 vault="${2:?missing vaultDir}"
 pass="${3:?missing passphrase}"
 
@@ -86,6 +91,10 @@ elif [ "$mode" = "name" ]; then
     # dirId, enc|dec and the names follow the passphrase, so hand the rest over verbatim.
     shift 3
     exec "$JAVA_HOME/bin/java.exe" "${UTF8[@]}" -cp "$MODS_WIN;$BUILD_WIN" NameDec "$vault" "$pass" "$@"
+elif [ "$mode" = "hash" ]; then
+    # The directory ids follow the passphrase.
+    shift 3
+    exec "$JAVA_HOME/bin/java.exe" "${UTF8[@]}" -cp "$MODS_WIN;$BUILD_WIN" DirHash "$vault" "$pass" "$@"
 else
     echo "unknown mode: $mode" >&2
     exit 2
