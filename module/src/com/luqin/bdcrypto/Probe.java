@@ -89,6 +89,9 @@ public final class Probe {
             Channel.command(ctx, arg);
         } else if ("get".equals(cmd)) {
             Logx.i(Channel.get(arg.isEmpty() ? cls : arg));
+        } else if ("nav".equals(cmd)) {
+            // P3: can a CloudFile the module makes up drive a navigation? See Nav.
+            Logx.i(Nav.probe(ctx, arg.isEmpty() ? cls : arg));
         } else if ("vault".equals(cmd)) {
             VaultProbe.run(ctx, arg.isEmpty() ? cls : arg);
         } else if ("unlock".equals(cmd)) {
@@ -140,6 +143,10 @@ public final class Probe {
                 + "                              only route to that directory's real contents.\n"
                 + "  unlock <cloudDir>=<pass>  the unlock button's own path: fetch the two config\n"
                 + "                              files, open the vault, keep the session (no dialog)\n"
+                + "  nav <cloudPath>           P3: make a CloudFile for a path out of thin air and ask\n"
+                + "                              the drawn page to navigate to it. Answers the one\n"
+                + "                              assumption the redirect rests on — whether the click\n"
+                + "                              path needs the app's own row object or just a path\n"
                 + "  session                   what vault is unlocked right now\n"
                 + "  state                     one-line summary of what has been captured\n"
                 + "  ls | clear                list / delete probe report files");

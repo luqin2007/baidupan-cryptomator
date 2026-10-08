@@ -929,6 +929,81 @@ public final class Hooks {
     }
 
     /**
+     * The breadcrumb path of the page drawn on top, e.g. {@code /我的网盘/crypto}, or null.
+     *
+     * <p>Same page identification as {@link #reconcile}, for the same measured reason: the window
+     * holds more than one page and the one behind reports {@code isShown()} = true as well, so the
+     * drawn one is the last copy whose breadcrumb reads. Exposed because it is the only
+     * self-contained answer to "where is the app right now", which is what an experiment that moves
+     * the app around needs in order to say whether it moved. Main thread.
+     */
+    static String drawnCrumb() {
+        final Context ctx = app;
+        if (ctx == null) {
+            return null;
+        }
+        int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
+        int idCrumb = ctx.getResources().getIdentifier("rv_breadcrumb", "id", APP_PKG);
+        if (idFilter == 0 || idCrumb == 0) {
+            return null;
+        }
+        java.util.List<android.view.View> copies = allCopies(idFilter);
+        for (int i = copies.size() - 1; i >= 0; i--) {
+            android.view.View f = copies.get(i);
+            if (!f.isShown()) {
+                continue;
+            }
+            String crumb = crumbPathOf(f, idFilter, idCrumb);
+            if (crumb != null) {
+                return crumb;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The breadcrumb adapter of the page the window is drawing, or null.
+     *
+     * <p>Same page identification as {@link #reconcile}, for the same measured reason: the window
+     * holds more than one page and the one behind reports {@code isShown()} = true as well, so the
+     * drawn one is the last copy whose breadcrumb reads.
+     *
+     * <p>Wanted by {@link Nav} because that adapter is where the page keeps its own "take me to this
+     * directory" callback — {@code BreadcrumbAdapter.Y(Function1, boolean)} takes it, and the crumb
+     * click handler {@code Q(int, BreadcrumbAdapter, CloudFile, View)} calls it with a
+     * {@code CloudFile}. That is the only navigation entry point found so far that does not amount
+     * to driving the app's UI by hand.
+     */
+    static Object drawnCrumbAdapter() {
+        final Context ctx = app;
+        if (ctx == null) {
+            return null;
+        }
+        int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
+        int idCrumb = ctx.getResources().getIdentifier("rv_breadcrumb", "id", APP_PKG);
+        if (idFilter == 0 || idCrumb == 0) {
+            return null;
+        }
+        java.util.List<android.view.View> copies = allCopies(idFilter);
+        for (int i = copies.size() - 1; i >= 0; i--) {
+            android.view.View f = copies.get(i);
+            if (!f.isShown() || crumbPathOf(f, idFilter, idCrumb) == null) {
+                continue;
+            }
+            android.view.View root = pageRootOf(f, idFilter, idCrumb);
+            android.view.View crumb = root == null ? null : root.findViewById(idCrumb);
+            if (crumb == null) {
+                continue;
+            }
+            Object a = Reflectx.call0(crumb, "getAdapter");
+            if (a != null) {
+                return a;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Takes this module's button out of every toolbar copy in the window. Main thread.
      *
      * <p>Every copy, not just the drawn one: a page that has merely stopped being listed is still in
