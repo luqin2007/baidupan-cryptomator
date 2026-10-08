@@ -118,7 +118,66 @@ public final class Vault {
 
     /** Where the root's entries live; only knowable after unlocking (it is key-dependent). */
     public String rootContentPath() throws IOException {
-        return cipher.contentPath("");
+        return contentPath("");
+    }
+
+    /**
+     * The vault-relative directory that holds {@code dirId}'s entries.
+     *
+     * <p>The device needs this to answer "the user is looking at {@code d/XY/…} — which directory
+     * is that?": the answer is whatever dirId hashes to that path, so the path is what a session
+     * records as it descends.
+     */
+    public String contentPath(String dirId) throws IOException {
+        return cipher.contentPath(dirId);
+    }
+
+    /**
+     * Cleartext name of one entry, given its on-disk name.
+     *
+     * @return null when the on-disk name carries no cleartext name to decrypt: files the format
+     *     uses for its own bookkeeping ({@link #isInternal}), a shortened name (whose real name is
+     *     inside it, see {@link #names}), or something that is not an entry at all
+     */
+    public String name(String dirId, String ciphertextName) throws IOException {
+        if (isInternal(ciphertextName)) {
+            // dirid.c9r / dir.c9r / name.c9s / contents.c9r: the format's own bookkeeping, not an
+            // entry, and `dirid` is not even valid base64 — decrypting it would throw.
+            return null;
+        }
+        if (ciphertextName.endsWith(C9R)) {
+            return cipher.decryptName(strip(ciphertextName, C9R), dirId);
+        }
+        return null;
+    }
+
+    /**
+     * Decrypts the names of one directory's entries, in the order given.
+     *
+     * <p>This is the entry point for the file page: the app already knows the ciphertext names of
+     * the directory it is drawing, so the module only has to translate them. It deliberately needs
+     * nothing but the names — no listing, no downloads — which is what makes it usable where a full
+     * {@link #walk()} is not (on the device the ciphertext is remote, and only the directory being
+     * browsed is available).
+     *
+     * <p>A shortened name ({@code .c9s}) comes back null: the real name lives in
+     * {@code <name>.c9s/name.c9s}, which cannot be read until that folder is listed. Callers should
+     * show the entry as unresolved rather than inventing a name for it.
+     *
+     * @throws VaultException a name that does not authenticate — the wrong directory id, or damage
+     */
+    public String[] names(String dirId, String[] ciphertextNames) throws IOException {
+        String[] out = new String[ciphertextNames.length];
+        for (int i = 0; i < ciphertextNames.length; i++) {
+            out[i] = name(dirId, ciphertextNames[i]);
+        }
+        return out;
+    }
+
+    /** True for the files the format keeps for itself; a file page must not show them. */
+    public static boolean isInternal(String name) {
+        return DIRID_FILE.equals(name) || DIR_FILE.equals(name)
+                || NAME_FILE.equals(name) || CONTENTS_FILE.equals(name);
     }
 
     /** Non-fatal contradictions found by the last {@link #walk()}: empty means the tree is clean. */
@@ -179,7 +238,7 @@ public final class Vault {
         }
 
         if (name.endsWith(C9R)) {
-            String cleartextName = cipher.decryptName(strip(name, C9R), directory.id);
+            String cleartextName = name(directory.id, name);
             if (store.isDirectory(entryPath)) {
                 // A subdirectory: the folder is named after the child's encrypted name and holds
                 // the child's id in cleartext.
@@ -204,7 +263,7 @@ public final class Vault {
                 throw new VaultException("shortened entry " + entryPath + " names '" + realName
                         + "', which is not a .c9r entry name");
             }
-            String cleartextName = cipher.decryptName(strip(realName, C9R), directory.id);
+            String cleartextName = name(directory.id, realName);
             String treePath = join(directory.path, cleartextName);
             if (store.exists(entryPath + "/" + DIR_FILE)) {
                 String child = childId(entryPath, treePath);

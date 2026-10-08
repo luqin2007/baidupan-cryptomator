@@ -3,7 +3,10 @@ import com.luqin.bdcrypto.vault.VaultEntry;
 import com.luqin.bdcrypto.vault.VaultException;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Offline P2 harness: unlock a vault and walk it, using the module's own vault package.
@@ -79,7 +82,84 @@ public final class P2Main {
         for (String warning : warnings) {
             System.out.println("  ! " + warning);
         }
-        System.out.println(warnings.isEmpty() ? "P2 TRAVERSAL CLEAN" : "P2 TRAVERSAL HAS WARNINGS");
-        System.exit(warnings.isEmpty() ? 0 : 1);
+
+        // ------------------------------------------------ the file page's entry point ---------
+        // names() is what the UI will call: it takes the ciphertext names a caller already has (on
+        // the device, the rows the app is drawing) and answers what each is called in cleartext. It
+        // has to agree with walk(), which is what cryptofs judges. The one thing it may decline is a
+        // shortened name, whose real name is inside the folder itself — and then the walk must have
+        // exactly as many names it alone could resolve as there were .c9s entries.
+        List<String> problems = new ArrayList<String>();
+        int dirsChecked = 0;
+        int resolvedNames = 0;
+        int shortened = 0;
+        for (VaultEntry dir : entries) {
+            if (!dir.directory) {
+                continue;
+            }
+            dirsChecked++;
+            String[] raw = vault.store().list(dir.ciphertextPath);
+            String[] plain = vault.names(dir.dirId, raw);
+            Set<String> resolved = new TreeSet<String>();
+            for (int i = 0; i < raw.length; i++) {
+                if (Vault.isInternal(raw[i])) {
+                    continue;
+                }
+                if (plain[i] == null) {
+                    if (raw[i].endsWith(".c9s")) {
+                        shortened++;
+                    } else {
+                        problems.add(dir.path + ": " + raw[i] + " has no cleartext name");
+                    }
+                    continue;
+                }
+                resolved.add(plain[i]);
+            }
+
+            Set<String> fromWalk = new TreeSet<String>();
+            for (VaultEntry child : entries) {
+                if (child != dir && dir.path.equals(parentPath(child.path))) {
+                    fromWalk.add(lastSegment(child.path));
+                }
+            }
+            fromWalk.removeAll(resolved);
+            resolvedNames += resolved.size();
+            if (fromWalk.size() != countShortened(raw)) {
+                problems.add(dir.path + ": names() resolved " + resolved.size() + " of "
+                        + (resolved.size() + fromWalk.size()) + " entries, but the directory holds "
+                        + countShortened(raw) + " shortened name(s); unresolved: " + fromWalk);
+            }
+        }
+
+        System.out.println();
+        System.out.println("names()  : " + dirsChecked + " dir(s), " + resolvedNames
+                + " name(s) resolved, " + shortened + " shortened (unresolved by design)");
+        System.out.println("problems : " + problems.size());
+        for (String problem : problems) {
+            System.out.println("  ! " + problem);
+        }
+        System.out.println(warnings.isEmpty() && problems.isEmpty()
+                ? "P2 TRAVERSAL CLEAN" : "P2 TRAVERSAL HAS WARNINGS");
+        System.exit(warnings.isEmpty() && problems.isEmpty() ? 0 : 1);
+    }
+
+    private static int countShortened(String[] raw) {
+        int n = 0;
+        for (String name : raw) {
+            if (name.endsWith(".c9s")) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static String parentPath(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash <= 0 ? "/" : path.substring(0, slash);
+    }
+
+    private static String lastSegment(String path) {
+        int slash = path.lastIndexOf('/');
+        return path.substring(slash + 1);
     }
 }
