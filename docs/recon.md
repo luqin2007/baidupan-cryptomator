@@ -1084,11 +1084,55 @@ APK 2.9 MB，release 签名正常。dex 中已确认含 `bdcrypto/vault/*`、
 遍历本来不需要读它就认得出目录，但这条检查把"我们使用的 id"和"这个目录自己的 id 备份"绑定在
 一起，id 取错时会立刻显形。
 
-### 13.6 仍然没做的（下一步）
+### 13.6 真机验证：dex + ART 上跑同一套代码（`0.11.0-p2a`）
+
+离线对拍只说明"桌面 JVM 上正确"。设备上还多两道关：dex/ART，以及另一套 JCA provider。
+为此模块加了一条探针命令（`VaultProbe`）：
+
+```bash
+adb push D:/cryptomator/p0d-fixture /sdcard/Download/BaiduNetdisk/p0d-fixture
+MSYS_NO_PATHCONV=1 bash tools/probe.sh vault \
+    '/sdcard/Download/BaiduNetdisk/p0d-fixture=p0d-fixture-passphrase-7QzmN4vT'
+adb pull /storage/emulated/0/Android/data/com.baidu.drive.app/files/bdcrypto/vault.txt
+bash tools/p2/p2.sh check-report /d/cryptomator/p0d-fixture '<口令>' <拉回来的报告>
+```
+
+⚠️ 首次 push **少了一个文件**：KJ 目录里那个 204 字符的密文名，`D:\cryptomator\…` 全路径
+**265 字符 > Windows MAX_PATH**，`adb.exe` 直接 `lstat` 失败（输出里只有一行 error，容易被
+"40 files pushed" 盖过去）。办法：把它复制成短名（工作区内）再 `adb push <短名> <设备上的长目标名>`，
+目标名在设备侧是 Linux 路径，不受影响；推完用 `sha256sum` 对过。
+
+结果（App 进程内，`main` 与 `:p2p` 两个进程都跑到，报告一致）：
+
+| 项 | 设备（Android 16 / arm64） | 桌面 |
+|---|---|---|
+| masterkey | `version=999`，scrypt / AES-KW / versionMac **全过** | 同 |
+| 根内容目录 | `d/KJ/R2V2ZOBQHYYMSGRBQ22P6GWYWGYRSV` | 同 |
+| 遍历 | 8 目录 / 21 文件 / 1,155,600 字节、**0 warning** | 同 |
+| 对拍 | `check-report` → **29 条与 cryptofs 完全一致** | `check` → 同 |
+| 耗时 | 解锁 2,475 ms、遍历 109 ms | 解锁 ~250 ms、遍历 ~19 ms |
+
+两点顺带的收获：
+
+- **模块能在 App 进程里读 `/sdcard/Download/BaiduNetdisk/…`**（`canRead=true`、`list()` 正常）
+  → P3 想用的"就地解密下载落点"这条路是通的，不需要先绕 scoped storage。
+- 广播会同时到达两个进程（`main` / `:p2p`），所以报告是两份 —— 判读时别以为是重复执行。
+
+### 13.7 第二个保险库（真实那个）也逐条一致
+
+`D:/cryptomator/baidu` 与 fixture 是**独立密钥 + 独立口令**，它的 1 目录 / 1 文件
+（`欢迎.rtf` 820 B）同样 `P2 CHECK OK: 2 entries match cryptofs` —— 换一把密钥、换一套 salt，
+解锁与遍历全部成立。该口令由用户在本机提供，**没有落进任何文件**。
+
+⚠️ 用户说明：**本机这份是初始状态，网盘里的保险库已经被上传过文件**，两者内容不同。
+所以这条只证明"同一格式下换密钥也对"，**网盘上那份的真实目录树还没走过** ——
+要走得先用 §11.7 的通道把云端密文拉下来（或走 P3 的下载落点）。
+
+### 13.8 仍然没做的（下一步）
 
 - **内容解密**：`68` 字节文件头的内部结构（§12.4 留的问题）仍未解开，明文内容还没解过 —— 属于 P3；
   `tools/oracle` 的 `sha256` / `b64` 两列要到那时才会进入对拍。
-- **真机接线**：App 进程里目前**没有任何代码调用这个包**（所以离线对拍用的是同一份源码，
-  但设备上还没跑过）。要把遍历接进文件页，先得让密文在 App 进程内可读（当前落点是
-  `/storage/emulated/0/Download/BaiduNetdisk/<云端相对路径>`，见 §11.5）。
+- **接进文件页**：vault 包现在只有一个调用点（探针），文件页还是占位提示。要做虚拟目录 /
+  面包屑 / 解密后的文件名列表，并把密文来源从"本地目录"换成云端（`CipherStore` 就是那个缝）。
+- **云端那份保险库**：见 §13.7 的提醒，网盘上真实的目录树还没验证过。
 - **写入**（P4/P5）：重命名 / 删除透传、上传加密需要的 SIV 加密与 base64url 编码还没写。

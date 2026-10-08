@@ -4,9 +4,10 @@ Runs the **module's own** vault traversal (`module/src/com/luqin/bdcrypto/vault/
 this machine and checks the result against the official Cryptomator implementation.
 
 ```bash
-bash tools/p2/p2.sh walk     /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
-bash tools/p2/p2.sh check    /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
-bash tools/p2/p2.sh negative /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
+bash tools/p2/p2.sh walk         /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
+bash tools/p2/p2.sh check        /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
+bash tools/p2/p2.sh check-report /d/cryptomator/p0d-fixture '<pass>' <report pulled off the phone>
+bash tools/p2/p2.sh negative     /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
 ```
 
 `walk` prints the manifest. `check` runs `tools/oracle/oracle.sh unlock` on the same vault, reduces
@@ -33,6 +34,19 @@ ok  wrong dirid.c9r size         ! dirid.c9r of 中文目录 is 100 bytes; an id
 P2 NEGATIVE OK: every provoked fault was detected
 ```
 
+## The device, not just the JVM
+
+The same sources run inside the app process (`probe.sh vault`, see `VaultProbe`), and the report it
+writes is checked by the same comparison:
+
+```bash
+bash tools/p2/p2.sh check-report /d/cryptomator/p0d-fixture '<pass>' release-vault.txt
+# P2 CHECK OK: 29 entries match cryptofs   — from the phone, 0 warnings
+```
+
+That is what covers dex + ART + a different JCA provider. Measured: unlock 2.5 s, walk 0.1 s on the
+device versus 0.25 s / 0.02 s on the desktop; the manifest is identical.
+
 ## Why it is built this way
 
 **It compiles the module's sources, not a copy of them.** `p2.sh` compiles
@@ -53,8 +67,10 @@ is where `tools/oracle`'s `sha256`/`b64` columns will finally be compared too.
 
 ## What P2 does not cover yet
 
-- **Nothing on the device calls this yet.** The traversal is verified offline; wiring it into the
-  file page needs the ciphertext to be readable from inside the app process first.
+- **The file page.** The traversal is reachable only through the probe; the module's unlock button is
+  still a placeholder.
+- **The cloud copy of a real vault.** Both vaults checked so far are the local ones; the netdisk vault
+  has had files uploaded to it since, so its actual tree has not been walked.
 - **Content decryption** (the 68-byte file header, chunked AES-GCM) is P3.
 - The harness prints `warnings: N` and exits non-zero if the traversal had to skip or contradict
   anything, so "0 warnings" is part of the result rather than a claim about it.

@@ -2,9 +2,11 @@
 #
 # P2 offline harness: run the module's own vault traversal and check it against the official oracle.
 #
-#   p2.sh walk  <vaultDir> <passphrase>     unlock + walk, print the manifest
-#   p2.sh check <vaultDir> <passphrase>     walk, then diff against tools/oracle's manifest
-#   p2.sh negative <vaultDir> <passphrase>  provoke the failure modes on a copy; all must be caught
+#   p2.sh walk     <vaultDir> <passphrase>            unlock + walk, print the manifest
+#   p2.sh check    <vaultDir> <passphrase>            walk, then diff against tools/oracle
+#   p2.sh check-report <vaultDir> <passphrase> <file> diff a manifest produced elsewhere (a device
+#                                                     report pulled with adb) against tools/oracle
+#   p2.sh negative <vaultDir> <passphrase>            provoke the failure modes on a copy
 #
 # What this proves and why it is shaped like this:
 #   * it compiles module/src/com/luqin/bdcrypto/vault/** with NO android.jar on the classpath, so
@@ -65,63 +67,80 @@ echo "sources: ${#SOURCES[@]} file(s) (module vault package + P2Main)" >&2
 "$JAVA_HOME/bin/javac.exe" -encoding UTF-8 -nowarn --release 11 \
     -cp "$LIBS" -d "$HERE_WIN/.build/classes" "${SOURCES[@]}"
 
-mode="${1:?usage: p2.sh walk|check|negative <vaultDir> <passphrase>}"
+mode="${1:?usage: p2.sh walk|check|check-report|negative <vaultDir> <passphrase>}"
 vault="${2:?missing vaultDir}"
 pass="${3:?missing passphrase}"
-
-run_p2() {
-    p2_into "$vault" "$pass"
-}
 
 p2_into() { # <vaultDir> <passphrase> — P2Main's stdout, exit code preserved
     "$JAVA_HOME/bin/java.exe" -Dstdout.encoding=UTF-8 -Dfile.encoding=UTF-8 \
         -cp "$LIBS;$HERE_WIN/.build/classes" P2Main "$1" "$2"
 }
 
+run_p2() {
+    p2_into "$vault" "$pass"
+}
+
 # Both manifests are reduced to one normalised line per entry (D/F/T kind, cleartext path,
 # ciphertext path, cleartext size) and sorted, so the comparison is about content and not about
 # spacing, ordering or the fields P2 does not produce yet (content digests are P3). -n + p means
 # every other line of either manifest — headers, timings, warnings — is dropped rather than diffed.
+# `totals   :` with padding is accepted too: that is what the on-device report looks like.
 normalise() {
     sed -n -E \
         -e 's/^DIR[[:space:]]+(.*[^[:space:]])[[:space:]]+<-[[:space:]]+([^[:space:]]+)[[:space:]]*$/D \1 \2/p' \
         -e 's/^FILE[[:space:]]+(.*[^[:space:]])[[:space:]]+<-[[:space:]]+([^[:space:]]+)[[:space:]]+size=([0-9]+).*$/F \1 \2 \3/p' \
-        -e 's/^totals:[[:space:]]*(.*)$/T \1/p' \
+        -e 's/^totals[[:space:]]*:[[:space:]]*(.*)$/T \1/p' \
         "$1" | LC_ALL=C sort
 }
 
-if [ "$mode" = "walk" ]; then
-    run_p2
-elif [ "$mode" = "check" ]; then
-    P2_OUT="$BUILD/p2-manifest.txt"
-    ORACLE_RAW="$BUILD/oracle-manifest.txt"
-    if ! run_p2 > "$P2_OUT"; then
-        echo "P2 traversal failed or reported warnings:" >&2
-        cat "$P2_OUT" >&2
-        exit 1
-    fi
-
+# Reduces one manifest of ours against cryptofs's, entry by entry.
+compare_with_oracle() { # <our manifest file>
+    local ours="$1"
+    local raw="$BUILD/oracle-manifest.txt"
     # The oracle prints logback noise (DEBUG/WARN lines) into the same stream; only its manifest
     # lines are of interest.
-    bash "$ROOT/tools/oracle/oracle.sh" unlock "$vault" "$pass" > "$ORACLE_RAW" 2>&1 || {
-        echo "oracle failed; see $ORACLE_RAW" >&2
-        exit 1
+    bash "$ROOT/tools/oracle/oracle.sh" unlock "$vault" "$pass" > "$raw" 2>&1 || {
+        echo "oracle failed; see $raw" >&2
+        return 1
     }
-    grep -E '^(DIR |FILE |totals:)' "$ORACLE_RAW" > "$BUILD/oracle-fixture-lines.txt" || true
+    grep -E '^(DIR |FILE |totals:)' "$raw" > "$BUILD/oracle-lines.txt" || true
 
-    normalise "$BUILD/oracle-fixture-lines.txt" > "$BUILD/expected.txt"
-    normalise "$P2_OUT" > "$BUILD/actual.txt"
+    normalise "$BUILD/oracle-lines.txt" > "$BUILD/expected.txt"
+    normalise "$ours" > "$BUILD/actual.txt"
 
     if diff -u "$BUILD/expected.txt" "$BUILD/actual.txt" > "$BUILD/manifest.diff"; then
         echo "P2 CHECK OK: $(grep -c '^[DF] ' "$BUILD/actual.txt") entries match cryptofs"
         grep -c '^D ' "$BUILD/actual.txt" | sed 's/^/  dirs : /'
         grep -c '^F ' "$BUILD/actual.txt" | sed 's/^/  files: /'
         grep '^T ' "$BUILD/actual.txt" | sed 's/^/  /'
-    else
-        echo "P2 CHECK FAILED — difference against cryptofs:" >&2
-        cat "$BUILD/manifest.diff" >&2
+        return 0
+    fi
+    echo "P2 CHECK FAILED — difference against cryptofs:" >&2
+    cat "$BUILD/manifest.diff" >&2
+    return 1
+}
+
+if [ "$mode" = "walk" ]; then
+    run_p2
+elif [ "$mode" = "check" ]; then
+    P2_OUT="$BUILD/p2-manifest.txt"
+    if ! run_p2 > "$P2_OUT"; then
+        echo "P2 traversal failed or reported warnings:" >&2
+        cat "$P2_OUT" >&2
         exit 1
     fi
+    compare_with_oracle "$P2_OUT"
+elif [ "$mode" = "check-report" ]; then
+    # For output this script cannot produce itself: the report the module writes on the device
+    # (adb pull …/bdcrypto/vault.txt). Same comparison, same authority.
+    report="${4:?missing reportFile}"
+    [ -f "$report" ] || { echo "no such report: $report" >&2; exit 2; }
+    grep -q 'P2 TRAVERSAL CLEAN' "$report" || {
+        echo "report is not clean (warnings or failure):" >&2
+        tail -5 "$report" >&2
+        exit 1
+    }
+    compare_with_oracle "$report"
 elif [ "$mode" = "negative" ]; then
     # Proves the check above can fail. A verification that has only ever been run against a good
     # vault is indistinguishable from one that always says "ok", so each failure mode the format

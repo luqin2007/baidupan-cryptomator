@@ -4,12 +4,14 @@
 认出 `vault.cryptomator` / `masterkey.cryptomator`，输入口令后把加密目录 `d/` 展示成解密后的
 文件名与目录树；下载时自动解密；删除 / 重命名 / 分享等操作透传回**原始密文文件**。
 
-> **状态**：🟡 **P0 / P1 完成，P2 的解锁与遍历已离线跑通，但 App 里还看不到解密目录** ——
+> **状态**：🟡 **P0 / P1 完成，P2 的解锁与遍历已通过真机验证，但 App 里还看不到解密目录** ——
 > 侦察阶段结束（`0.10.1-p0b2`），决定架构的事实已在真机上全部钉死，模块也已能自行取到云端文件字节；
 > 文件页的「解密」按钮按保险库识别正确出现/消失，但点击后仍是占位提示。
 > **P2 的核心（scrypt → AES-KW 解主密钥、`vault.cryptomator` 验签、SIV 文件名解密、整棵目录树遍历）
-> 已由模块自己实现**，并与官方 cryptofs 在测试保险库上**逐条对拍一致**（8 目录 / 21 文件，
-> 见 [`tools/p2/README.md`](tools/p2/README.md)）。还没做的是把它接进文件页，以及 P3 的内容解密。
+> 已由模块自己实现**，与官方 cryptofs 在测试保险库上**逐条对拍一致**，并且在 **App 进程内
+> 跑出同一份清单**（8 目录 / 21 文件；设备上解锁 2.5 s、遍历 0.1 s）。两个保险库（fixture 与真实那份）
+> 都对拍通过。还没做的是把它接进文件页，以及 P3 的内容解密。
+> 见 [`tools/p2/README.md`](tools/p2/README.md) 与 [`docs/recon.md`](docs/recon.md) §13。
 > 路线图见 [§5](#5-路线图)。
 >
 > **许可**：[AGPL-3.0](LICENSE)（因为运行期依赖 Cryptomator 官方的 AGPL 库，见 [§7](#7-许可)）
@@ -116,7 +118,7 @@ APK 里存在 `libnetdisk-signature-check.so`、`libbaiduprotect_sec.so`、`libm
 |---|---|---|---|
 | **P0** | 模块骨架 + 运行时探针 + 内容通道侦察 + 打包可行性验证 | 模块能装进 App 进程；探针能吐出全部目标类的**真实签名**；cryptolib 能进 dex；**模块能自己拿到云端文件字节** | ✅ P0-A/B/C/D 全部通过（`0.10.1-p0b2`，2026-10-08） |
 | **P1** | 在工具栏注入「解密」按钮，仅当当前目录含 `vault.cryptomator` 时显示 | 进出保险库目录按钮出现 / 消失；点击弹出口令输入 | ✅ 按钮生命周期通过（`v0.9.1-p1`）；弹出的仍是占位提示，真正解锁在 P2 |
-| **P2** | 解锁 + 目录遍历 + SIV 文件名解密（模块自己实现，cryptofs 进不了 dex），再在文件页上做成虚拟解密目录 | 与 Cryptomator 桌面版逐条对照，中文名 / 空格 / 多级目录全一致 | 🟡 密码学与遍历**离线完成并对拍通过**（`tools/p2`，8 目录 / 21 文件逐条一致，2026-10-08）；**尚未接进 App**（虚拟目录 / 面包屑未做） |
+| **P2** | 解锁 + 目录遍历 + SIV 文件名解密（模块自己实现，cryptofs 进不了 dex），再在文件页上做成虚拟解密目录 | 与 Cryptomator 桌面版逐条对照，中文名 / 空格 / 多级目录全一致 | 🟡 密码学与遍历**已完成并对拍通过**：离线 `p2.sh check` 与**真机探针报告**都是 8 目录 / 21 文件逐条一致（2026-10-08），反证 4/4；**尚未接进 App**（虚拟目录 / 面包屑未做） |
 | **P3** | 下载自动解密：劫持下载完成点，就地解密并还原真实文件名 | 下载 → 拿到可打开的明文 | ⬜ |
 | **P4** | 删除 / 重命名 / 分享透传（靠 P2 保留的原始 `fsId`） | 解密态下操作，云端作用于**原密文** | ⬜ |
 | **P5** | 上传自动加密（可选） | 桌面版能正常打开上传的文件 | ⬜ |
@@ -222,6 +224,8 @@ B='am broadcast -a com.luqin.bdcrypto.PROBE'
 "$ADB" shell "$B --es cmd items"                           # 已捕获的 CloudFile 行
 "$ADB" shell "$B --es cmd state"
 "$ADB" shell "$B --es cmd ls"                              # 报告文件列表
+"$ADB" shell "$B --es cmd vault --es arg /sdcard/Download/BaiduNetdisk/p0d-fixture=<口令>"
+                                                           # P2：在设备上解锁 + 遍历，报告 -> vault.txt
 ```
 
 大批量输出不写 logcat（会被截断、会插进 App 自己的日志），而是写到 App 自己的外部目录：
@@ -284,10 +288,12 @@ P2 的验收工具：把**模块自己的** `vault/` 源码编译起来（classp
 ```bash
 bash tools/p2/p2.sh walk  /d/cryptomator/p0d-fixture '<口令>'   # 模块解出来的树
 bash tools/p2/p2.sh check /d/cryptomator/p0d-fixture '<口令>'   # 与官方 cryptofs 对拍
+bash tools/p2/p2.sh check-report /d/cryptomator/p0d-fixture '<口令>' <从手机拉回来的报告>
+bash tools/p2/p2.sh negative /d/cryptomator/p0d-fixture '<口令>' # 反证：4 种故障必须被抓住
 ```
 
-当前结果：**29 条（8 目录 + 21 文件）逐条一致**，且遍历 0 warning。
-设计理由与覆盖范围见 [`tools/p2/README.md`](tools/p2/README.md)。
+当前结果：**29 条（8 目录 + 21 文件）逐条一致** —— 桌面上如此，**真机（App 进程内）拉回来的报告
+也如此**，且都是 0 warning。设计理由与覆盖范围见 [`tools/p2/README.md`](tools/p2/README.md)。
 
 ### `tools/probe.sh` 与 `tools/ui.py`
 

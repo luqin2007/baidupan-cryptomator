@@ -87,6 +87,8 @@ public final class Probe {
             Logx.i(Hooks.copiesReport("probe"));
         } else if ("ch".equals(cmd)) {
             Channel.command(ctx, arg);
+        } else if ("vault".equals(cmd)) {
+            VaultProbe.run(ctx, arg.isEmpty() ? cls : arg);
         } else {
             Logx.w("unknown cmd: " + cmd);
             help();
@@ -115,6 +117,9 @@ public final class Probe {
                 + "                              hier   - the type graph of each captured object\n"
                 + "                                       (the only way to read an R8-renamed class)\n"
                 + "                              go <n|name> [flag] - download one of them for real\n"
+                + "  vault <dir>=<pass>        P2: unlock a vault directory on the DEVICE and walk it\n"
+                + "                              (report -> vault.txt; use the fixture's passphrase\n"
+                + "                               only — the broadcast command line lands in logcat)\n"
                 + "  state                     one-line summary of what has been captured\n"
                 + "  ls | clear                list / delete probe report files");
     }
