@@ -1136,3 +1136,69 @@ bash tools/p2/p2.sh check-report /d/cryptomator/p0d-fixture '<口令>' <拉回�
   面包屑 / 解密后的文件名列表，并把密文来源从"本地目录"换成云端（`CipherStore` 就是那个缝）。
 - **云端那份保险库**：见 §13.7 的提醒，网盘上真实的目录树还没验证过。
 - **写入**（P4/P5）：重命名 / 删除透传、上传加密需要的 SIV 加密与 base64url 编码还没写。
+
+---
+
+## 14. P2 文件页（2026-10-08 中午：解锁已通，行名重写未生效）
+
+### 14.1 已实测通过：App 内解锁（**真实云端保险库**）
+
+LSPosed 日志原文（`0.11.1-p2b`，App 进程内）：
+
+```
+[button] clicked -> passphrase dialog for /crypto/content
+[vault] masterkey.cryptomator already on disk (329 B)
+[vault] vault.cryptomator already on disk (283 B)
+[vault] OK: /crypto/content unlocked (format 8 / SIV_GCM, root content d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7)
+```
+
+- 口令框在 App 内（`VaultUi.onUnlockClicked`，Activity 上下文，不是 application 上下文 —— 后者没有
+  window token，`AlertDialog` 会抛）。
+- 两个配置文件走 P0-B 的落点：**已在本地就直接读**，不在才用 `Channel.fetch` 让 App 自己下一次；
+  实测两个都在（P0-B 那次下载留在盘上），所以这次没有触发下载。
+- `Vault.open` 只需要这两个文件，**不需要 `d/`**（离线也复现过：只有这两个文件的目录里
+  `open` 成功，`walk()` 报 1 条 `no content directory`）。这正是"解锁"能与"取整棵树"分开的原因。
+- 会话：`VaultUi.session()` = vault + 云端目录 + 本地目录 + 「哪个密文目录是哪个 dirId」；
+  `probe.sh session` 可查。⚠️ **每个进程各有一份会话**（`main` 与 `:p2p` 会分别答复）。
+
+### 14.2 界面事实（行渲染的依据，全部实测）
+
+| 项 | 值 | 证据 |
+|---|---|---|
+| 列表 RecyclerView | `com.baidu.netdisk.filelist.view.FileListRecyclerView`，id `list_recycler_view` | `dumpsys activity top` |
+| `setAdapter` 实收 | `FileListWrapperAdapter`；其字段 `_` = `FileListAdapter`（super `com.baidu.netdisk.kernel.architecture.adapter.RecyclerCursorAdapter`） | 适配器 dump |
+| 绑定入口 | `RecyclerCursorAdapter.onBindViewHolder(ViewHolder,int)`；`FileListAdapter` **自己的**实现是 `O(ViewHolder, Cursor)`（混淆名） | probe dump |
+| ViewHolder | `FileListAdapter$__`（**0 字段**，靠 `findViewById` 绑定）；行列由 `FileListAdapter$_`（implements `IItemCardInflater`）创建 | probe dump |
+| 行容器 | `com.baidu.drive.app:id/checkable_layout`（`CheckableItemLayout`） | uiautomator |
+| **显示名** | `com.baidu.drive.app:id/text1`（`EllipsizeTextView`） | uiautomator；链条 RecyclerView → checkable_layout → RelativeLayout(无 id) → text1 |
+| 行点击 | itemcard inflater 的匿名类 `com.baidu.netdisk.filelist.itemcard.__`（字段 `_ FileListAdapter, __ int, ___ CloudFile`）→ `FileListAdapter.q/r/s` → `FileListChildFragment.initRecyclerView$lambda$…` | probe dump |
+| 进目录 | `NetDiskFileListFragment.addNewChildFragment(Object, boolean)` / `createNewFragment(Object,boolean)`；返回 `backToDir(String)`；打开条目 `filelist.usecase.ViewItemUseCase` | probe dump；**参数是 CloudFile 还是路径串未定** |
+
+### 14.3 未生效：行名重写（下一步的第一件事）
+
+现象：进到 `/crypto/content/d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7`（**保险库根内容目录**，
+会话里 dirId = `""`）后，行仍然是 `kymd3lVEAXDmA07lgpuoDiebhu6fvHpvkCQ=.c9r` 和 `dirid.c9r`，
+没有变成 `欢迎.rtf`、也没隐藏。
+
+诊断（按可能性排序，下一次要一次排除掉）：
+
+1. **钩错了方法**。`XposedBridge.hookAllMethods(c, name, …)` 只挂 **c 自己声明** 的方法，而
+   `[list] hooked …` 是**无条件打印**的 —— 所以"日志里有 hooked"不构成"真的挂上了"。真正的绑定
+   入口是 **`FileListWrapperAdapter.onBindViewHolder`**（RecyclerView 调的是 wrapper），内层适配器
+   的实际绑定是混淆的 **`O(ViewHolder, Cursor)`**；只挂继承来的
+   `RecyclerCursorAdapter.onBindViewHolder` 与 `FileListAdapter.onBindViewHolder` 很可能一个都没命中。
+2. `VaultUi.session()` 为 null（进程不对）。`probe.sh session` 能分辨：`main` 与 `:p2p` 各答一次。
+3. `drawnCloudPath` 没更新（`reconcile` 没跑）→ `dirIdOf(rel)` 返回 null → 直接 return。
+
+对策（一次到位）：**同时挂三个**（wrapper 的 `onBindViewHolder`、`RecyclerCursorAdapter` 的
+`onBindViewHolder`、`FileListAdapter.O`），并在**第一次绑定时打印一行**
+（`text=` / `drawn=` / `dirId=`）——把"到底有没有进来"从推断变成日志事实。
+
+### 14.4 三个设计决定（写下来，免得下一个人重走）
+
+- **只改显示，不改模型。** `CloudFile.getFileName()` 必须保持密文名：下载 / 删除 / 分享 / 重命名
+  都得作用在原始密文上（P4 的契约）。改的只能是绑定出来的那个 `TextView`。
+- **「密文目录 → dirId」的映射必须由会话维护。** `d/XY/…` 是 `hashDirectoryId(dirId)`，单向；
+  只有从保险库根一路走下来才知道当前页是哪个 dirId。跳着进去的页面解不出来，这是格式的性质。
+- **`.c9s`（超长名）在父目录里解不出来**：真名在文件夹内部的 `name.c9s`，而那个文件只有在该
+  文件夹被 **列出** 之后才有 CloudFile 可下载。现在原样显示（不猜），留到下一步。
