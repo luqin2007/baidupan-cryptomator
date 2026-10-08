@@ -88,6 +88,14 @@ public final class Channel {
     private static final int MAX_FILES = 200;
     private static final List<Object> files = Collections.synchronizedList(new ArrayList<Object>());
 
+    /**
+     * Where the app's own downloads land. Measured, not configured (docs/recon.md §11.5): the
+     * landing path is {@code <root>/<cloud path>} with the cloud path's leading slash removed, and
+     * P0-B verified the bytes written there are sha256-identical to the originals — which is why
+     * the module can read ciphertext the app has already fetched instead of asking for it again.
+     */
+    static final String DOWNLOAD_ROOT = "/storage/emulated/0/Download/BaiduNetdisk";
+
     private Channel() {
     }
 
@@ -493,6 +501,90 @@ public final class Channel {
         return sb.toString();
     }
 
+    // ------------------------------------------------- local landing ------
+
+    /** The file the app's own download of {@code cloudPath} produces — or reuses. */
+    static java.io.File localFileFor(String cloudPath) {
+        String rel = cloudPath.startsWith("/") ? cloudPath.substring(1) : cloudPath;
+        return new java.io.File(DOWNLOAD_ROOT, rel);
+    }
+
+    /** The held CloudFile whose own path is exactly {@code cloudPath}, or null. */
+    private static Object heldFileFor(String cloudPath) {
+        // A copy: `files` is written from the list's own threads while this reads it (the P0-B
+        // ConcurrentModificationException was exactly this mistake).
+        for (Object o : new ArrayList<Object>(files)) {
+            if (cloudPath.equals(Reflectx.callStr(o, "getFilePath"))) {
+                return o;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Gets one cloud file onto local disk, for callers that need bytes rather than a probe answer.
+     *
+     * <p>An existing file is used as it is: the app deduplicates downloads, so something it has
+     * already fetched is never written twice and waiting for a "fresh" copy would only time out.
+     * The price is the reverse case — a file the app believes it downloaded but which is gone from
+     * disk cannot be recovered here, and the caller gets null rather than a wrong answer.
+     *
+     * @return the local file, or null if it is neither on disk nor obtainable
+     */
+    static java.io.File fetch(final String cloudPath, long timeoutMs) {
+        final java.io.File local = localFileFor(cloudPath);
+        if (local.isFile() && local.length() > 0) {
+            return local;
+        }
+        final Object held = heldFileFor(cloudPath);
+        if (held == null) {
+            Logx.w("[fetch] " + cloudPath + ": the app has never listed that path");
+            return null;
+        }
+        // The app's entry points take an Activity and are entitled to touch UI, so the trigger runs
+        // on the main thread while this worker waits for it to return and then for the file to land.
+        final CountDownLatch triggered = new CountDownLatch(1);
+        mainHandler().post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    downloadHeld(held, 0, new StringBuilder());
+                } catch (Throwable t) {
+                    Logx.w("[fetch] " + cloudPath + ": trigger threw " + t);
+                } finally {
+                    triggered.countDown();
+                }
+            }
+        });
+        try {
+            if (!triggered.await(30, TimeUnit.SECONDS)) {
+                Logx.w("[fetch] " + cloudPath + ": the trigger never returned");
+                return null;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (local.isFile() && local.length() > 0) {
+                Logx.i("[fetch] " + cloudPath + " -> " + local.getAbsolutePath()
+                        + " (" + local.length() + " B)");
+                return local;
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        Logx.w("[fetch] " + cloudPath + ": not on disk after " + timeoutMs
+                + " ms (already-downloaded files are skipped by the app, so an absent file may "
+                + "simply be missing from disk)");
+        return local.isFile() && local.length() > 0 ? local : null;
+    }
+
     // ------------------------------------------------------------ replay ----
 
     /**
@@ -544,26 +636,37 @@ public final class Channel {
     }
 
     private static String replayOnMain(String which, int flag) {
-        List<Object> copy = new ArrayList<Object>(files);
-        Object target = null;
-        try {
-            int idx = Integer.parseInt(which);
-            if (idx >= 0 && idx < copy.size()) {
-                target = copy.get(idx);
-            }
-        } catch (Throwable ignored) {
-            for (Object o : copy) {
-                if (which.equals(Reflectx.callStr(o, "getFileName"))) {
-                    target = o;
-                    break;
-                }
-            }
-        }
+        Object target = heldBySpec(which);
         StringBuilder sb = new StringBuilder("ch go:\n");
         if (target == null) {
             return sb.append("  no held CloudFile matches '").append(which).append("' (")
-                    .append(copy.size()).append(" held; try 'ch files')\n").toString();
+                    .append(files.size()).append(" held; try 'ch files')\n").toString();
         }
+        downloadHeld(target, flag, sb);
+        return sb.toString();
+    }
+
+    /** Resolves a probe spec — an index into {@code ch files}, or a file name — to a held file. */
+    private static Object heldBySpec(String which) {
+        List<Object> copy = new ArrayList<Object>(files);
+        try {
+            int idx = Integer.parseInt(which);
+            if (idx >= 0 && idx < copy.size()) {
+                return copy.get(idx);
+            }
+            return null;
+        } catch (Throwable ignored) {
+            for (Object o : copy) {
+                if (which.equals(Reflectx.callStr(o, "getFileName"))) {
+                    return o;
+                }
+            }
+            return null;
+        }
+    }
+
+    /** Hands one held CloudFile to the app's own download pipeline and describes what happened. */
+    private static void downloadHeld(Object target, int flag, StringBuilder sb) {
         String fileName = Reflectx.callStr(target, "getFileName");
         List<Object> list = new ArrayList<Object>();
         list.add(target);
@@ -593,7 +696,8 @@ public final class Channel {
             if (attempt(sb, manager, "d", new Object[]{list, factory, receiver, flag})
                     || attempt(sb, manager, "e", new Object[]{list, factory, receiver, flag, null})
                     || attempt(sb, manager, "f", new Object[]{target, factory, receiver, flag})) {
-                return sb.append("  result: an entry point accepted the task\n").toString();
+                sb.append("  result: an entry point accepted the task\n");
+                return;
             }
         }
         if (api != null && lastActivity != null) {
@@ -605,10 +709,11 @@ public final class Channel {
                     || attempt(sb, api, "c",
                     new Object[]{lastActivity, list, flag, 0, Boolean.TRUE, null, null, null, null,
                             null})) {
-                return sb.append("  result: an entry point accepted the task\n").toString();
+                sb.append("  result: an entry point accepted the task\n");
+                return;
             }
         }
-        return sb.append("  result: every entry point refused (see the lines above)\n").toString();
+        sb.append("  result: every entry point refused (see the lines above)\n");
     }
 
     /** Tries one method name; returns true only if a matching overload ran without throwing. */

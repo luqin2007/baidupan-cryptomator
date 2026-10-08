@@ -35,7 +35,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  */
 public final class Hooks {
 
-    private static final String APP_PKG = "com.baidu.drive.app";
+    /** The app's package: resource ids are resolved against it, and it is the target's identity. */
+    static final String APP_PKG = "com.baidu.drive.app";
 
     /** Cap on retained row samples; a vault listing is small but a scan of / could be large. */
     private static final int MAX_ROWS = 4000;
@@ -197,6 +198,8 @@ public final class Hooks {
         // P0-B. The pipeline hook above only renders arguments; this one keeps them, which is what
         // makes a replay possible at all (see Channel for why the objects cannot be built).
         Channel.install(cl);
+        // P2's file page half: row text for an unlocked vault.
+        VaultList.install(cl);
         Logx.i("app hooks installed in " + (System.currentTimeMillis() - t0) + " ms; "
                 + (missingTargets.size() - before) + " target(s) missing"
                 + (missingTargets.isEmpty() ? "" : " -> " + missingTargets));
@@ -765,6 +768,39 @@ public final class Hooks {
         return slash <= 0 ? "/" : path.substring(0, slash);
     }
 
+    /**
+     * Asks one page's list to bind its rows again.
+     *
+     * <p>Deferred with {@code post}: {@code notifyDataSetChanged} throws if the RecyclerView is in
+     * the middle of a layout pass, and this runs from a timer that cannot know that.
+     */
+    private static void rebindRows(final android.view.View page) {
+        if (page == null || app == null) {
+            return;
+        }
+        final int id = app.getResources().getIdentifier("list_recycler_view", "id", APP_PKG);
+        if (id == 0) {
+            return;
+        }
+        final android.view.View list = page.findViewById(id);
+        if (list == null) {
+            return;
+        }
+        page.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Object adapter = Reflectx.call0(list, "getAdapter");
+                    if (adapter != null) {
+                        Reflectx.call0(adapter, "notifyDataSetChanged");
+                    }
+                } catch (Throwable t) {
+                    Logx.w("[list] rebind failed: " + t);
+                }
+            }
+        });
+    }
+
     /** Whether a reconcile is already queued; a burst of triggers collapses into one pass. */
     private static final java.util.concurrent.atomic.AtomicBoolean reconcilePending =
             new java.util.concurrent.atomic.AtomicBoolean();
@@ -778,7 +814,7 @@ public final class Hooks {
      * breadcrumb of the directory being <em>left</em>. One pending pass is enough — later triggers
      * only move it, and the pass re-reads the tree from scratch.
      */
-    private static void reconcileSoon(final String why) {
+    static void reconcileSoon(final String why) {
         if (reconcilePending.getAndSet(true)) {
             return;
         }
@@ -861,6 +897,12 @@ public final class Hooks {
 
         String vault = vaultDirMatching(drawn);
         lastWantedDir = vault;
+        // The rows of this page may already have been bound before the breadcrumb told us where the
+        // page is, so a change of directory is what asks the list to bind them again — otherwise the
+        // decrypted names would only appear once the user scrolled.
+        if (VaultList.noteDrawnPath(drawn)) {
+            rebindRows(drawnCopy);
+        }
         if (vault != null) {
             // Restricted to the drawn page's own subtree. The window can hold two containers that
             // both show the same directory — measured, four copies over two containers, each
@@ -931,7 +973,7 @@ public final class Hooks {
     }
 
     /** A visible acknowledgement that the whole detect path ran, on the app's own UI. */
-    private static void toast(final String msg) {
+    static void toast(final String msg) {
         final Context c = app;
         if (c == null) {
             return;
@@ -1232,8 +1274,10 @@ public final class Hooks {
             b.setOnClickListener(new android.view.View.OnClickListener() {
                 @Override
                 public void onClick(android.view.View v) {
-                    Logx.i("[button] clicked");
-                    toast("BdCryptomator：保险库已识别，解锁功能将在下一阶段接入");
+                    Logx.i("[button] clicked -> passphrase dialog for " + vaultDir);
+                    // The button's own context IS the page's activity, which is what a dialog
+                    // needs; the application context has no window token and throws.
+                    VaultUi.onUnlockClicked(v.getContext(), vaultDir);
                 }
             });
             placed++;

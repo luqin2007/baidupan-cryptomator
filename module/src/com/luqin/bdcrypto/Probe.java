@@ -89,6 +89,17 @@ public final class Probe {
             Channel.command(ctx, arg);
         } else if ("vault".equals(cmd)) {
             VaultProbe.run(ctx, arg.isEmpty() ? cls : arg);
+        } else if ("unlock".equals(cmd)) {
+            // The button's own path (fetch config, open the vault, keep the session) without the
+            // dialog, so the device test can be scripted: <cloudDir>=<passphrase>.
+            int eq = arg.indexOf('=');
+            if (eq <= 0 || eq == arg.length() - 1) {
+                Logx.w("usage: --es cmd unlock --es arg <cloudDir>=<passphrase>");
+            } else {
+                Logx.i(VaultUi.unlockNow(arg.substring(0, eq), arg.substring(eq + 1)));
+            }
+        } else if ("session".equals(cmd)) {
+            Logx.i("vault session: " + VaultUi.stateLine());
         } else {
             Logx.w("unknown cmd: " + cmd);
             help();
@@ -120,6 +131,9 @@ public final class Probe {
                 + "  vault <dir>=<pass>        P2: unlock a vault directory on the DEVICE and walk it\n"
                 + "                              (report -> vault.txt; use the fixture's passphrase\n"
                 + "                               only — the broadcast command line lands in logcat)\n"
+                + "  unlock <cloudDir>=<pass>  the unlock button's own path: fetch the two config\n"
+                + "                              files, open the vault, keep the session (no dialog)\n"
+                + "  session                   what vault is unlocked right now\n"
                 + "  state                     one-line summary of what has been captured\n"
                 + "  ls | clear                list / delete probe report files");
     }
