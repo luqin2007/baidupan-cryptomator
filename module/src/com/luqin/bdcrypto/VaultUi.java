@@ -10,8 +10,8 @@ import com.luqin.bdcrypto.vault.Vault;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The file page's unlock: the passphrase dialog, the session it produces, and the translation from
@@ -52,7 +52,7 @@ public final class VaultUi {
         public final String cloudDir;
         public final File localDir;
         public final Vault vault;
-        private final Map<String, String> dirIdByContent = new HashMap<String, String>();
+        private final Map<String, String> dirIdByContent = new ConcurrentHashMap<String, String>();
 
         Session(String cloudDir, File localDir, Vault vault) throws IOException {
             this.cloudDir = cloudDir;
@@ -64,6 +64,43 @@ public final class VaultUi {
         /** The id of the directory whose ciphertext sits at this vault-relative path, or null. */
         public String dirIdOf(String vaultRelativeContentPath) {
             return dirIdByContent.get(vaultRelativeContentPath);
+        }
+
+        /**
+         * The id of the directory a breadcrumb reading names, or null.
+         *
+         * <p><b>Suffix matching, not prefix, and that is not a detail.</b> The breadcrumb is a
+         * {@code RecyclerView}: only its visible crumbs are in the view tree, so as the user
+         * descends the leading crumbs are recycled away. Measured on the device, the vault's own
+         * root content directory reads as {@code /content/d/SY/RGEQ…} — the {@code /crypto} that
+         * {@link #cloudDir} starts with is simply gone. Matching on {@code indexOf(cloudDir)}
+         * therefore returns null exactly on the page that has something to decrypt.
+         *
+         * <p>What is invariant is the <em>tail</em>: a breadcrumb reading always ends with the
+         * directory being shown. Longest match wins, so when a nested vault directory joins the
+         * session it cannot be shadowed by an ancestor whose path is a suffix of it.
+         */
+        public String dirIdOfDrawn(String drawn) {
+            if (drawn == null) {
+                return null;
+            }
+            String bestPath = null;
+            String bestDirId = null;
+            for (Map.Entry<String, String> e : dirIdByContent.entrySet()) {
+                String path = "/" + e.getKey();
+                if (drawn.equals(path) || drawn.endsWith(path)) {
+                    if (bestPath == null || path.length() > bestPath.length()) {
+                        bestPath = path;
+                        bestDirId = e.getValue();
+                    }
+                }
+            }
+            return bestDirId;
+        }
+
+        /** For the log: which directories this session can name. */
+        public String knownPaths() {
+            return dirIdByContent.keySet().toString();
         }
 
         public void remember(String vaultRelativeContentPath, String dirId) {
