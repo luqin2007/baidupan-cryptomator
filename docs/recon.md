@@ -1139,7 +1139,7 @@ bash tools/p2/p2.sh check-report /d/cryptomator/p0d-fixture '<口令>' <拉回�
 
 ---
 
-## 14. P2 文件页（2026-10-08 中午：解锁已通，行名重写未生效）
+## 14. P2 文件页（2026-10-08：解锁已通；行名重写的两个故障已修，重命名待口令验证）
 
 ### 14.1 已实测通过：App 内解锁（**真实云端保险库**）
 
@@ -1174,25 +1174,54 @@ LSPosed 日志原文（`0.11.1-p2b`，App 进程内）：
 | 行点击 | itemcard inflater 的匿名类 `com.baidu.netdisk.filelist.itemcard.__`（字段 `_ FileListAdapter, __ int, ___ CloudFile`）→ `FileListAdapter.q/r/s` → `FileListChildFragment.initRecyclerView$lambda$…` | probe dump |
 | 进目录 | `NetDiskFileListFragment.addNewChildFragment(Object, boolean)` / `createNewFragment(Object,boolean)`；返回 `backToDir(String)`；打开条目 `filelist.usecase.ViewItemUseCase` | probe dump；**参数是 CloudFile 还是路径串未定** |
 
-### 14.3 未生效：行名重写（下一步的第一件事）
+### 14.3 已修：行名重写的**两个**独立故障（`0.11.4-p2e`）
 
-现象：进到 `/crypto/content/d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7`（**保险库根内容目录**，
-会话里 dirId = `""`）后，行仍然是 `kymd3lVEAXDmA07lgpuoDiebhu6fvHpvkCQ=.c9r` 和 `dirid.c9r`，
-没有变成 `欢迎.rtf`、也没隐藏。
+现象（`0.11.1-p2b`）：进到 `/crypto/content/d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7` 后，
+行仍是 `kymd3l…==.c9r` / `dirid.c9r`，没有变成 `欢迎.rtf`、也没隐藏。
 
-诊断（按可能性排序，下一次要一次排除掉）：
+两个故障**都得修** —— 只修第一个，现象一点都不会变，第二个会照样把它挡掉。
 
-1. **钩错了方法**。`XposedBridge.hookAllMethods(c, name, …)` 只挂 **c 自己声明** 的方法，而
-   `[list] hooked …` 是**无条件打印**的 —— 所以"日志里有 hooked"不构成"真的挂上了"。真正的绑定
-   入口是 **`FileListWrapperAdapter.onBindViewHolder`**（RecyclerView 调的是 wrapper），内层适配器
-   的实际绑定是混淆的 **`O(ViewHolder, Cursor)`**；只挂继承来的
-   `RecyclerCursorAdapter.onBindViewHolder` 与 `FileListAdapter.onBindViewHolder` 很可能一个都没命中。
-2. `VaultUi.session()` 为 null（进程不对）。`probe.sh session` 能分辨：`main` 与 `:p2p` 各答一次。
-3. `drawnCloudPath` 没更新（`reconcile` 没跑）→ `dirIdOf(rel)` 返回 null → 直接 return。
+**(a) 钩在了不承载该调用的方法上。**
 
-对策（一次到位）：**同时挂三个**（wrapper 的 `onBindViewHolder`、`RecyclerCursorAdapter` 的
-`onBindViewHolder`、`FileListAdapter.O`），并在**第一次绑定时打印一行**
-（`text=` / `drawn=` / `dirId=`）——把"到底有没有进来"从推断变成日志事实。
+`hookAllMethods(c, name, cb)` 只挂 **c 自己声明** 的方法，且**既不报错也不报成功**；
+旧构建那行 `[list] hooked FileListAdapter.onBindViewHolder` 是**无条件打印**的，
+它点名的方法该类根本没有：
+
+| 类 | 逐行绑定方法 | 旧构建 | 现在 |
+|---|---|---|---|
+| `FileListWrapperAdapter` | `onBindViewHolder(ViewHolder,int)` | 没挂 | ✅ |
+| `RecyclerCursorAdapter` | `onBindViewHolder(ViewHolder,int)`（`O` 是 **abstract**） | 挂了个空方法 | ✅ |
+| `FileListAdapter` | **`O(ViewHolder, Cursor)`**（混淆名） | 没挂 | ✅ |
+
+现按**签名**发现（参数为 ViewHolder + Cursor），不只按名字；跳过 abstract/native；
+某类一个都没命中会明说。实测 `bind entry points hooked: 3`，且**绑定真的进来了**
+（旧构建从头到尾一条都没有）：
+
+```
+[list] bind text=dirid.c9r drawn=/content/d/SY/RGEQ… :: no vault unlocked in this process
+```
+
+**(b) 面包屑是滑动窗口，`indexOf(cloudDir)` 永远匹配不上。**
+
+`VaultList` 原用 `drawn.indexOf("/crypto/content")` 定位当前目录。但面包屑是个
+`RecyclerView`，**只有可见的节在视图树里**；同一个页面在不同时刻读到的 `drawn`：
+
+```
+/crypto  →  /crypto/content  →  /crypto/content/d  →  /crypto/content/d/SY
+         →  /content/d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7      ← /crypto 被回收
+```
+
+前缀匹配于是返回 −1、整页被跳过 —— 而且**偏偏是在唯一有东西可解的那一页**上。
+`Hooks.reconcile` 一直用的是另一种匹配（`samePath` = equals 或 endsWith），
+`VaultList` 是唯一的例外。现改为**后缀最长匹配** —— 约定：面包屑读数**总是**以
+"当前正在显示的目录"结尾，这是唯一成立的不变量。
+
+顺带两处：`Session` 的目录表改 `ConcurrentHashMap`（解锁在 worker 线程、行重绑在 UI 线程）；
+绑定日志改**按页**计量（旧的固定 15 条被首页的行用光，保险库页根本没轮到），
+且 `.c9r`/`.c9s` 结尾的行**不受配额限制**，行内直接写结果（renamed / hidden / left）。
+
+> **已验证**：三个入口挂上、绑定带着真实密文名到达。
+> **尚未验证**：重命名本身 —— 需要解锁，而口令不在仓库里（见 §11.4）。
 
 ### 14.4 三个设计决定（写下来，免得下一个人重走）
 
