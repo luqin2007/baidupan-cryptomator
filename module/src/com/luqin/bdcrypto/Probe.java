@@ -87,6 +87,8 @@ public final class Probe {
             Logx.i(Hooks.copiesReport("probe"));
         } else if ("ch".equals(cmd)) {
             Channel.command(ctx, arg);
+        } else if ("get".equals(cmd)) {
+            Logx.i(Channel.get(arg.isEmpty() ? cls : arg));
         } else if ("vault".equals(cmd)) {
             VaultProbe.run(ctx, arg.isEmpty() ? cls : arg);
         } else if ("unlock".equals(cmd)) {
@@ -131,6 +133,11 @@ public final class Probe {
                 + "  vault <dir>=<pass>        P2: unlock a vault directory on the DEVICE and walk it\n"
                 + "                              (report -> vault.txt; use the fixture's passphrase\n"
                 + "                               only — the broadcast command line lands in logcat)\n"
+                + "  get <cloudPath>           fetch one cloud file through the app and print its\n"
+                + "                              first bytes as hex + ascii. Built for the vault's\n"
+                + "                              36-byte dir.c9r pointers: <name>.c9r/dir.c9r holds the\n"
+                + "                              child directory's id in the clear, and the id is the\n"
+                + "                              only route to that directory's real contents.\n"
                 + "  unlock <cloudDir>=<pass>  the unlock button's own path: fetch the two config\n"
                 + "                              files, open the vault, keep the session (no dialog)\n"
                 + "  session                   what vault is unlocked right now\n"

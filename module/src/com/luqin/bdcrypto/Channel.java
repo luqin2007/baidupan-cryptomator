@@ -585,6 +585,58 @@ public final class Channel {
         return local.isFile() && local.length() > 0 ? local : null;
     }
 
+    /**
+     * Fetches a cloud file and shows its first bytes, for a caller that must read a file rather
+     * than merely have it.
+     *
+     * <p>Written for the vault's directory pointers. {@code <name>.c9r/dir.c9r} is 36 bytes of
+     * plaintext holding the child directory's id, and it is the only way to get from an entry the
+     * user clicked to the {@code d/XY/…} folder that actually holds that directory's contents — the
+     * folder name is a one-way hash of that id, so there is nothing to guess from the outside. The
+     * bytes are printed as hex *and* as ASCII because the payload is a UUID, i.e. readable text;
+     * a hex dump alone would turn a check that takes one glance into one that takes a lookup table.
+     *
+     * @return a human-readable report, never null
+     */
+    static String get(String cloudPath) {
+        if (cloudPath == null || cloudPath.isEmpty()) {
+            return "get: usage: --es cmd get --es arg <cloudPath>";
+        }
+        java.io.File f = fetch(cloudPath, 20000);
+        if (f == null) {
+            return "get: " + cloudPath + " is neither on disk nor obtainable"
+                    + " (the app only downloads a path it has listed at least once)";
+        }
+        byte[] buf = new byte[(int) Math.min(f.length(), 8192)];
+        int n = 0;
+        try {
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            try {
+                while (n < buf.length) {
+                    int r = in.read(buf, n, buf.length - n);
+                    if (r < 0) {
+                        break;
+                    }
+                    n += r;
+                }
+            } finally {
+                in.close();
+            }
+        } catch (Throwable t) {
+            return "get: " + f.getAbsolutePath() + " (" + f.length() + " B) unreadable: " + t;
+        }
+        StringBuilder hex = new StringBuilder();
+        StringBuilder ascii = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            int b = buf[i] & 0xFF;
+            hex.append(Character.forDigit(b >>> 4, 16)).append(Character.forDigit(b & 0xF, 16));
+            ascii.append(b >= 0x20 && b < 0x7F ? (char) b : '.');
+        }
+        return "get: " + f.getAbsolutePath() + "  " + f.length() + " B"
+                + "\nhex  : " + hex
+                + "\nascii: " + ascii;
+    }
+
     // ------------------------------------------------------------ replay ----
 
     /**

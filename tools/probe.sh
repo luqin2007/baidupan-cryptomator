@@ -24,15 +24,29 @@ ADB="${ADB:-/c/Dev/AndroidSDK/platform-tools/adb.exe}"
 export ANDROID_SERIAL="${ANDROID_SERIAL:-adb-68701bc5-igYOHf._adb-tls-connect._tcp}"
 SSH_HOST="${SSH_HOST:-u0_a373@192.168.1.136}"
 SSH_PORT="${SSH_PORT:-8022}"
-LOG="${LSPD_LOG:-/data/adb/lspd/log/modules_2026-10-07T10:53:31.831644.log}"
 
 cmd="${1:?usage: p.sh <cmd> [clsOrArg]}"
 extra="${2:-}"
+
+# LSPosed starts a fresh modules_*.log per app process, and this module's answers land in the
+# newest one — so a hard-coded path goes silent the moment the app is restarted. That is not
+# hypothetical: it cost a whole round of "the probe printed nothing" before anyone looked at
+# `ls -t /data/adb/lspd/log`. Resolved on every run unless LSPD_LOG overrides it.
+latest_log() {
+    ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no "$SSH_HOST" \
+        "su -c 'ls -t /data/adb/lspd/log/modules_*.log 2>/dev/null | head -1'" 2>/dev/null | tr -d '\r'
+}
 
 pull() {
     ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no "$SSH_HOST" "su -c 'cat $LOG'" 2>/dev/null \
         | sed 's/^\[[^]]*\][^(]*([^)]*)\[[^]]*\] BDCrypto: //' > "$CACHE"
 }
+
+LOG="${LSPD_LOG:-$(latest_log)}"
+if [ -z "$LOG" ]; then
+    echo "p.sh: no modules_*.log on the device (ssh $SSH_HOST:$SSH_PORT)" >&2
+    exit 1
+fi
 
 pull
 before=$(wc -l < "$CACHE")

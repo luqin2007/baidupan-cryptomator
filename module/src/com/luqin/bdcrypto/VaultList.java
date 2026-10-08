@@ -65,25 +65,20 @@ public final class VaultList {
     private static final String NAME_ID = "text1";
 
     /**
-     * How many binds to narrate per page.
+     * How many binds to narrate per page: ordinary rows briefly, ciphertext rows generously.
      *
-     * <p>Per page, not per process: a fixed budget is spent long before the interesting page is
-     * reached — the previous build's first fifteen binds were all rows of the home page, so the
-     * vault directory never got to say anything. Ciphertext names bypass the quota, because a row
-     * the module is supposed to rewrite is exactly the one worth hearing about.
-     */
-    private static final int BIND_LOG_PER_PAGE = 3;
-
-    /**
-     * Hard cap, so a pathological rebind loop cannot flood the log.
+     * <p>Per page, not per process. A process-wide budget sounds safer and is worse, because the
+     * spending is invisible: ordinary browsing reaches the vault directory through the home page,
+     * {@code /crypto}, {@code /crypto/content}, {@code d} and {@code d/SY}, and a page that rebinds
+     * as it scrolls runs the counter up on its own. Once the budget is gone the module keeps working
+     * and stops saying anything, which reads exactly like "the hook never ran" — it cost an entire
+     * diagnostic session on a build where the row rewriting was in fact fine.
      *
-     * <p>Was 40, which is too small to be anything but a trap: reaching the vault directory means
-     * walking through the home page, {@code /crypto}, {@code /crypto/content}, {@code d} and
-     * {@code d/SY}, and the ciphertext names of a listing alone are three lines each — so the
-     * budget was spent before the page that matters, and the vault root logged <em>nothing</em>.
-     * That is how a measurement added specifically to be quoted went missing for a whole build.
+     * <p>So the cap is per page and split by kind. A ciphertext row is always worth a line (it is
+     * the thing being rewritten); a cleartext-looking row is not.
      */
-    private static final int BIND_LOG_MAX = 200;
+    private static final int BIND_LOG_ROWS_PER_PAGE = 3;
+    private static final int BIND_LOG_CIPHERTEXT_PER_PAGE = 24;
 
     /** The directory the drawn page is showing, as a cloud path. Set by {@link Hooks#reconcile}. */
     private static volatile String drawnCloudPath;
@@ -98,7 +93,7 @@ public final class VaultList {
     /** Binds narrated so far. Only ever touched from a bind, i.e. the UI thread. */
     private static String bindLogPath;
     private static int bindLogsForPath;
-    private static int bindLogsTotal;
+    private static int bindCiphertextForPath;
 
     private VaultList() {
     }
@@ -254,24 +249,34 @@ public final class VaultList {
     }
 
     /**
-     * Narrates the first few binds of each page.
+     * Narrates a page's binds, a few ordinary rows and many ciphertext ones.
      *
      * <p>This exists because "the hook ran" and "the hook was never called" used to look identical
-     * from the outside: the previous build logged {@code [list] hooked …} unconditionally, so the
-     * log said everything was fine while nothing was rewritten.
+     * from the outside: an earlier build logged {@code [list] hooked …} unconditionally, so the log
+     * said everything was fine while nothing was rewritten.
+     *
+     * <p>The counters are per page and per kind — see the constants. They are deliberately not
+     * cumulative: a silent cap turns a working module into one that merely stops talking, and that
+     * is the more expensive failure of the two.
      */
     private static void logBind(String text, String note) {
         String page = drawnCloudPath;
         if (page == null ? bindLogPath != null : !page.equals(bindLogPath)) {
             bindLogPath = page;
             bindLogsForPath = 0;
+            bindCiphertextForPath = 0;
         }
-        boolean ciphertext = text.endsWith(".c9r") || text.endsWith(".c9s");
-        if (bindLogsTotal >= BIND_LOG_MAX || (!ciphertext && bindLogsForPath >= BIND_LOG_PER_PAGE)) {
-            return;
+        if (text.endsWith(".c9r") || text.endsWith(".c9s")) {
+            if (bindCiphertextForPath >= BIND_LOG_CIPHERTEXT_PER_PAGE) {
+                return;
+            }
+            bindCiphertextForPath++;
+        } else {
+            if (bindLogsForPath >= BIND_LOG_ROWS_PER_PAGE) {
+                return;
+            }
+            bindLogsForPath++;
         }
-        bindLogsForPath++;
-        bindLogsTotal++;
         Logx.i("[list] bind text=" + text + " drawn=" + page + " :: " + note);
     }
 
