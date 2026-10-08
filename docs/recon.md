@@ -192,6 +192,11 @@ shade 情况：
 打包实测：`d8 --min-api 24` 把两个 jar 与模块类一起产出 **单个 5.8 MB `classes.dex`**，
 无重复类错误、无需 multidex，构建 40 秒。→ **P0-C 通过**。
 
+> ⚠️ **2026-10-08 更正（见 §13.3）：`d8` 成功 ≠ 运行期可用。** d8 不会去解析"没有任何代码调用"
+> 的引用，而 cryptolib 的入口在运行期会向 **guava** 要 `Preconditions`（`gson` 则在
+> `MasterkeyFileAccess` 路径上）。当时模块里**没有一个类调用 cryptolib**，所以这个洞在 P0-C
+> 完全看不见。P2 起用真实调用才暴露出来。
+
 ---
 
 ## 7. 待运行时验证的问题（P0 的剩余目标）
@@ -844,6 +849,9 @@ P0-D 的测试保险库已完成（见 §12），P2 的对照物齐了。剩下�
 （`dirId` 是 UUID、`dir.c9r` 明文、`dirid.c9r` 走加密通道）+ 文件名解密。
 读密文用 §11.7 的通道，读出后用 `tools/oracle` 的清单比对。
 
+> ✅ **2026-10-08 下午已完成** —— 实现与逐条对拍结果见 **§13**。真机接线（把遍历接进文件页）
+> 与内容解密（`68` 字节文件头的内部结构）仍未做，属于下一步。
+
 ---
 
 ## 12. P0-D 测试保险库 + 保险库结构实测（2026-10-08 上午）
@@ -961,3 +969,126 @@ d/<hash[0:2]>/<rest>/                 某目录的内容目录，hash = hashDire
 是正常的，**不能靠"目录里看到了什么"判断保险库内容**，只能靠 `d/` 下的密文树。
 
 
+
+---
+
+## 13. P2：模块自研的解锁与目录遍历（2026-10-08 下午，离线完成）
+
+P2 的交付物是 `module/src/com/luqin/bdcrypto/vault/`：**模块自己**读 `masterkey.cryptomator`
+（scrypt → AES-KW → `versionMac`）与 `vault.cryptomator`（HS256 JWT 验签），然后沿 `d/` 走完
+整棵密文树、把条目名解密回明文。cryptofs 进不了 dex（Java 25 + `java.nio.file` + guava/jackson），
+所以这段只能自己写；`tools/oracle`（官方 cryptolib + cryptofs）是裁判。
+
+### 13.1 验收：与官方 cryptofs 逐条对拍
+
+```bash
+bash tools/p2/p2.sh check /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
+# P2 CHECK OK: 29 entries match cryptofs
+#   dirs : 8
+#   files: 21
+#   T 8 dir(s), 21 file(s), 1155600 cleartext byte(s)
+```
+
+29 条 = 8 个目录（含根 `/`）+ 21 个文件。两边各自归一化成
+`(类型, 明文路径, 密文路径, 明文大小)` 后排序、diff **为空**。覆盖中文名、空格、emoji、
+Windows 非法字符、仅大小写不同、空文件、32 KiB 边界两侧、1 MiB、超长名（`.c9s`）、三层嵌套。
+`p2.sh` 还要求本次遍历 **0 warning**（任何跳过或自相矛盾都会让它退出非零）。
+
+关键性质：`p2.sh` 编译的是**模块自己的源文件**（`module/src/com/luqin/bdcrypto/vault/**`），
+且 classpath 里**没有 `android.jar`** —— 遍历里混进 Android 依赖会在这里就编译失败，而不是在
+手机上。classpath 也只有模块真正打包的两个 jar（`cryptolib` / `siv-mode`）加上 §13.3 的那个垫片，
+所以"桌面能过、设备不能跑"这类差异在这里过不去。
+
+**反证（同一个脚本的 `negative` 模式）**：只跑过一个健康保险库的验收，与"永远返回 ok"的验收
+无法区分，所以四种故障都在副本上被主动制造出来，并要求出现**特定的**报错：
+
+```
+ok  wrong passphrase        VAULT ERROR: key unwrap failed its integrity check (the passphrase does not belong to this vault)
+ok  tampered entry name     VAULT ERROR: entry name does not authenticate under directory '76f46e85-…'
+ok  tampered vault config   VAULT ERROR: vault.cryptomator's HS256 signature does not verify (…)
+ok  wrong dirid.c9r size    ! dirid.c9r of 中文目录 is 100 bytes; an id of 36 bytes should have made it 132
+P2 NEGATIVE OK: every provoked fault was detected
+```
+
+注意第 4 条与前三条**性质不同**：它不是崩溃，而是"树照常解出来了，但有一条 warning"，
+而 `p2.sh` 把 warning 也算失败 —— 因为静默跳过一个条目会让解密视图**看起来对、实际不对**。
+
+### 13.2 反汇编/实测敲定的四个事实（都与直觉相反或无从推断）
+
+**(a) `hashDirectoryId` 不是哈希，而且与密钥有关。**
+`FileNameCryptorImpl.hashDirectoryId` 的字节码是三步：
+`SIV_encrypt(encKey, macKey, dirId 的 UTF-8 字节)`（**不带 associated data**）→ `SHA-1` →
+`base32`。所以根目录的内容目录 `d/KJ/R2V2ZOBQHYYMSGRBQ22P6GWYWGYRSV` **必须先解锁才能算出来**，
+"目录名是 dirId 的函数"这句话只有在拿到主密钥之后才成立。旧记录里"dirId 32 字符 = base32(SHA1)"
+的说法两头都不对：32 字符的是这个输出，dirId 本身是 UUID。
+
+**(b) 文件名的 SIV associated data 是「一个可能为空的元素」，不是「没有」。**
+cryptolib 的签名是 `decryptFilename(BaseEncoding, String name, byte[]... associatedData)`，
+cryptofs 传的是 `dirId.getBytes(UTF_8)`：根目录于是传了**一个长度 0 的元素**。RFC 5297 里
+`S2V` 对「零个 AD」和「一个空 AD」给出**不同**结果，两者都不报错、只是一个能认证一个不能。
+我们按 cryptofs 的传法实现（永远恰好一个元素），实测在根与三层嵌套下全部认证通过；
+注意 (a) 里的 `hashDirectoryId` 用的却是**零个 AD**，两者不能混。
+
+**(c) `name.c9s` 里存的是「完整密文名」，连 `.c9r` 后缀一起。**
+实测 `cMb2dfXhAjJxCuWk_4Isll9guPE=.c9s/name.c9s` 内容形如
+`Y2Xh…Ms=.c9r`（280 字节文本），长度也吻合：明文名 190 字符 → SIV 206 字节 → base64url 276 字符
++ `.c9r` = 280；另一个 204 → 220 → 296 + 4 = 300。**缩短与否取决于「密文名」的长度**（threshold
+220），不是明文名的长度 —— 所以 fixture 里没有一个明文名超过 220 字符，却有两个 `.c9s`。
+
+**(d) `.c9s/` 里既可能是文件也可能是目录**，靠同目录下有没有 `dir.c9r` / `contents.c9r` 区分：
+
+```
+cMb2df…=.c9s/name.c9s + dir.c9r        -> 超长【目录】名（dir.c9r 是子目录 id，明文 UUID）
+sQvGEB…=.c9s/name.c9s + contents.c9r   -> 超长【文件】名（内容在 contents.c9r）
+```
+
+只认"`.c9r` 结尾就是文件"的实现会整片漏掉这两类，而且**不会报错**。
+
+### 13.3 P0-C 的洞：「能进 dex」不等于「能跑」
+
+P2 第一次真正调用 cryptolib 就暴露了三个依赖问题，全是**运行期**才出现的：
+
+| 组件 | 运行期还需要 | 处理 |
+|---|---|---|
+| `DestroyableSecretKey`（构造函数/访问器） | `com.google.common.base.Preconditions` | 自带 4 个方法的同名垫片（`module/src/com/google/common/base/Preconditions.java`） |
+| `Scrypt`（内部 new 一个 `DestroyableSecretKey`） | 同上 | 同上。scrypt 本身**继续用官方的**（内存硬，不值得重写） |
+| `MasterkeyFileAccess` / `MasterkeyFile` | `gson` | **不用它们**：`masterkey.cryptomator` 只有 7 个字段，自己解析 |
+| `AesKeyWrap` | JCA `Cipher.getInstance("AESWrap")` | **不用它**：自己实现 RFC 3394（`AES/ECB/NoPadding`，40 行），正确性由紧随其后的 `versionMac` 反向保证 |
+| `BaseEncoding`（guava） | guava | **不用它**：base32 / base64url 自己实现（各 20 行，`java.util.Base64` 还要 API 26） |
+
+垫片的语义是规范级的（`IllegalArgumentException` / `NullPointerException`），且**宿主 App 若自带
+guava，父加载器优先，我们的版本根本不会被加载**，行为一致。SIV 则相反：**继续用官方的
+`siv-mode`**（已随 APK 打包），因为 SIV 写错的失败模式是"文件名看起来怪"而不是异常。
+
+教训与 §11.7/§11.8 是同一条，只是换了一层：**"构建通过"和"什么都没调用"叠在一起时，构建通过不
+构成任何证据。** d8 不会去解析没人调用的引用。
+
+打包复核（新增 vault 包后）：`bash module/build.sh`（`VERSION_CODE=16 VERSION_NAME=0.10.2-p0b3`）
+全流程通过，仍是**单个** `classes.dex` **5,877,172 字节**（与 P0-C 的 5.8 MB 一致，未触发 multidex），
+APK 2.9 MB，release 签名正常。dex 中已确认含 `bdcrypto/vault/*`、
+`com/google/common/base/Preconditions`、`org/cryptomator/siv/SivMode`、`cryptolib/common/Scrypt`。
+
+### 13.4 顺带修掉的工具缺陷：oracle 清单的非 ASCII 名会变成乱码
+
+`oracle.sh` 原先直接 `java …`，JVM 按机器的 ANSI 代码页编码 stdout，于是清单里的中文/emoji 名
+（`中文目录`、`emoji-🎉-✓.txt`）落成乱码 —— 对比同一个保险库的两份清单会**假失败**。
+已加 `-Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8`（不只是好看：这个清单的用途就是 diff）。
+
+### 13.5 体积模型的求逆（21 个文件全对）
+
+`disk = 68 + 28*ceil(clear/32768) + clear` 在 P0-D 是正向测出来的；P2 需要反向（还没下载的文件
+也要显示大小），实现为"从小到大试 chunk 数，取第一个自洽解"，并对 21 个文件的
+`size=` 与官方清单**逐条相同**（0 / 24 / 32 / 40 / 48 / 64 / 8192 / 32767 / 32768 / 32769 / 1048576
+全部命中）。`dirid.c9r` 是已知例外（空 id 也写了一个 chunk，96 = 68+28），所以它不参与这个换算，
+而是单独做一致性检查：`dirid.c9r` 的字节数应当等于 `96 + len(dirId)`。8 个目录全部吻合 ——
+遍历本来不需要读它就认得出目录，但这条检查把"我们使用的 id"和"这个目录自己的 id 备份"绑定在
+一起，id 取错时会立刻显形。
+
+### 13.6 仍然没做的（下一步）
+
+- **内容解密**：`68` 字节文件头的内部结构（§12.4 留的问题）仍未解开，明文内容还没解过 —— 属于 P3；
+  `tools/oracle` 的 `sha256` / `b64` 两列要到那时才会进入对拍。
+- **真机接线**：App 进程里目前**没有任何代码调用这个包**（所以离线对拍用的是同一份源码，
+  但设备上还没跑过）。要把遍历接进文件页，先得让密文在 App 进程内可读（当前落点是
+  `/storage/emulated/0/Download/BaiduNetdisk/<云端相对路径>`，见 §11.5）。
+- **写入**（P4/P5）：重命名 / 删除透传、上传加密需要的 SIV 加密与 base64url 编码还没写。

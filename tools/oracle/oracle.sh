@@ -63,13 +63,19 @@ mode="${1:?usage: oracle.sh check|unlock|make <vaultDir> <passphrase>}"
 vault="${2:?missing vaultDir}"
 pass="${3:?missing passphrase}"
 
+# Force UTF-8 on stdout/stderr. Not cosmetic: the manifest is meant to be diffed, and a vault entry
+# name can be anything the user's filesystem allowed (the P0-D fixture has Chinese, an emoji and a
+# space). Without this the JVM encodes the console stream in the machine's ANSI code page and every
+# non-ASCII path comes back mangled — a diff of two manifests of the SAME vault then "fails".
+UTF8=(-Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8)
+
 if [ "$mode" = "check" ]; then
-    exec "$JAVA_HOME/bin/java.exe" -cp "$MODS_WIN;$BUILD_WIN" CheckPass \
+    exec "$JAVA_HOME/bin/java.exe" "${UTF8[@]}" -cp "$MODS_WIN;$BUILD_WIN" CheckPass \
         "$vault/masterkey.cryptomator" "$pass"
 elif [ "$mode" = "unlock" ]; then
-    exec "$JAVA_HOME/bin/java.exe" -cp "$MODS_WIN;$BUILD_WIN" Unlock "$vault" "$pass"
+    exec "$JAVA_HOME/bin/java.exe" "${UTF8[@]}" -cp "$MODS_WIN;$BUILD_WIN" Unlock "$vault" "$pass"
 elif [ "$mode" = "make" ]; then
-    exec "$JAVA_HOME/bin/java.exe" -cp "$MODS_WIN;$BUILD_WIN" MakeVault "$vault" "$pass"
+    exec "$JAVA_HOME/bin/java.exe" "${UTF8[@]}" -cp "$MODS_WIN;$BUILD_WIN" MakeVault "$vault" "$pass"
 else
     echo "unknown mode: $mode" >&2
     exit 2

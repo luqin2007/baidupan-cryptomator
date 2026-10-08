@@ -4,10 +4,13 @@
 认出 `vault.cryptomator` / `masterkey.cryptomator`，输入口令后把加密目录 `d/` 展示成解密后的
 文件名与目录树；下载时自动解密；删除 / 重命名 / 分享等操作透传回**原始密文文件**。
 
-> **状态**：🟡 **P0 + P1 完成，尚不能解密** —— 侦察阶段结束（`0.10.1-p0b2`），
-> 决定架构的事实已在真机上全部钉死，模块也已能自行取到云端文件字节；
+> **状态**：🟡 **P0 / P1 完成，P2 的解锁与遍历已离线跑通，但 App 里还看不到解密目录** ——
+> 侦察阶段结束（`0.10.1-p0b2`），决定架构的事实已在真机上全部钉死，模块也已能自行取到云端文件字节；
 > 文件页的「解密」按钮按保险库识别正确出现/消失，但点击后仍是占位提示。
-> 真正的解密读写在 **P2**，路线图见 [§5](#5-路线图)。
+> **P2 的核心（scrypt → AES-KW 解主密钥、`vault.cryptomator` 验签、SIV 文件名解密、整棵目录树遍历）
+> 已由模块自己实现**，并与官方 cryptofs 在测试保险库上**逐条对拍一致**（8 目录 / 21 文件，
+> 见 [`tools/p2/README.md`](tools/p2/README.md)）。还没做的是把它接进文件页，以及 P3 的内容解密。
+> 路线图见 [§5](#5-路线图)。
 >
 > **许可**：[AGPL-3.0](LICENSE)（因为运行期依赖 Cryptomator 官方的 AGPL 库，见 [§7](#7-许可)）
 
@@ -67,6 +70,9 @@ Cryptomator 的 Android 官方客户端需要把整个保险库通过 WebDAV / �
 | 目录布局 `d/<前2>/<余30>` | 实见 `d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7/`（dirId 32 字符） |
 | 官方 `cryptolib-2.2.2` **可以直接上 Android** | 4649 个类中 4647 个是 Java 8（major 52）；BC 已 shade 到 `org.cryptomator.cryptolib.shaded.bouncycastle`；与 `siv-mode` 的 shade 包**无重叠**（唯一重叠是 `module-info.class`） |
 | **cryptolib 能打进单个 dex** | `cryptolib` + `siv-mode` 经 d8 产出 **5.8 MB 单个 `classes.dex`**，无重复类、无需 multidex，构建 40 秒 |
+| ⚠️ **但"能 dex"不等于"能跑"** | cryptolib 的入口在运行期会向 **guava** 要 `com.google.common.base.Preconditions`（`MasterkeyFileAccess` 还要 gson）。d8 不解析"没人调用"的引用，所以当时模块里没有一个类调用 cryptolib，这个洞在 P0-C 完全看不见 —— P2 真正调用时才暴露（recon §13.3） |
+| 模块自带 4 个方法的 `Preconditions` 垫片 | `module/src/com/google/common/base/Preconditions.java`：语义是规范级的；宿主 App 若自带 guava，父加载器优先，我们的版本不会被加载 |
+| **`hashDirectoryId` 不是哈希** | `base32(SHA1(SIV_encrypt(encKey, macKey, dirId)))` —— **与密钥有关**，不解锁就算不出根目录在 `d/` 下的位置（recon §13.2a） |
 
 ### 3.1 安全 / 反检测
 
@@ -110,7 +116,7 @@ APK 里存在 `libnetdisk-signature-check.so`、`libbaiduprotect_sec.so`、`libm
 |---|---|---|---|
 | **P0** | 模块骨架 + 运行时探针 + 内容通道侦察 + 打包可行性验证 | 模块能装进 App 进程；探针能吐出全部目标类的**真实签名**；cryptolib 能进 dex；**模块能自己拿到云端文件字节** | ✅ P0-A/B/C/D 全部通过（`0.10.1-p0b2`，2026-10-08） |
 | **P1** | 在工具栏注入「解密」按钮，仅当当前目录含 `vault.cryptomator` 时显示 | 进出保险库目录按钮出现 / 消失；点击弹出口令输入 | ✅ 按钮生命周期通过（`v0.9.1-p1`）；弹出的仍是占位提示，真正解锁在 P2 |
-| **P2** | 虚拟解密目录（核心）：scrypt → AES-KW 解主密钥（**仅内存**），解 SIV 文件名，读 `dirid.c9r` 拿子目录 ID，接管导航与面包屑 | 与 Cryptomator 桌面版逐条对照，中文名 / 空格 / 多级目录全一致 | ⬜ |
+| **P2** | 解锁 + 目录遍历 + SIV 文件名解密（模块自己实现，cryptofs 进不了 dex），再在文件页上做成虚拟解密目录 | 与 Cryptomator 桌面版逐条对照，中文名 / 空格 / 多级目录全一致 | 🟡 密码学与遍历**离线完成并对拍通过**（`tools/p2`，8 目录 / 21 文件逐条一致，2026-10-08）；**尚未接进 App**（虚拟目录 / 面包屑未做） |
 | **P3** | 下载自动解密：劫持下载完成点，就地解密并还原真实文件名 | 下载 → 拿到可打开的明文 | ⬜ |
 | **P4** | 删除 / 重命名 / 分享透传（靠 P2 保留的原始 `fsId`） | 解密态下操作，云端作用于**原密文** | ⬜ |
 | **P5** | 上传自动加密（可选） | 桌面版能正常打开上传的文件 | ⬜ |
@@ -240,6 +246,9 @@ module/
     Reflectx.java              反射辅助：完整签名渲染、对象图遍历
     Report.java                报告文件写出
     Logx.java                  日志（logcat + LSPosed 双通道，长文本分片）
+    vault/                     P2：保险库实现（解锁 / 目录遍历 / 文件名解密）
+                               无 Android 依赖，cryptofs 进不了 dex 所以这里自己写
+  src/com/google/common/base/Preconditions.java   cryptolib 运行期要的 4 个 guava 方法（垫片）
   stubs/de/robv/…             Xposed API 编译期存根（不进 dex）
   res/ assets/                xposed_init 与全量类名索引
   tools/dexdump.py            dex 分析工具（见下）
@@ -247,6 +256,7 @@ module/
   build.sh                    全流程构建
 tools/dexdump.py              离线 dex 逆向工具
 tools/oracle/                 桌面端 Cryptomator 参考工具：验口令 / 出明文清单 / 造测试保险库
+tools/p2/                     离线对拍：用模块自己的遍历走保险库，与 oracle 的清单 diff
 docs/recon.md                 侦察原始记录
 ```
 
@@ -265,6 +275,19 @@ tools/oracle/oracle.sh make   <保险库> '<口令>'    # 造 P0-D 测试保险�
 需要 **JDK 25**（cryptofs 是 class file 69）与本地 Cryptomator 安装的 jar。
 保险库结构与体积模型的实测结论见 [`docs/recon.md`](docs/recon.md) §12 与
 [`tools/oracle/README.md`](tools/oracle/README.md)。
+
+### `tools/p2/`
+
+P2 的验收工具：把**模块自己的** `vault/` 源码编译起来（classpath 里**故意没有 `android.jar`**），
+走一遍测试保险库，再与 `tools/oracle` 的清单逐条 diff。
+
+```bash
+bash tools/p2/p2.sh walk  /d/cryptomator/p0d-fixture '<口令>'   # 模块解出来的树
+bash tools/p2/p2.sh check /d/cryptomator/p0d-fixture '<口令>'   # 与官方 cryptofs 对拍
+```
+
+当前结果：**29 条（8 目录 + 21 文件）逐条一致**，且遍历 0 warning。
+设计理由与覆盖范围见 [`tools/p2/README.md`](tools/p2/README.md)。
 
 ### `tools/probe.sh` 与 `tools/ui.py`
 
@@ -306,6 +329,10 @@ python tools/dexdump.py --dex <dir> sig     <正则>                      # 全�
 与 [`siv-mode`](https://github.com/cryptomator/siv-mode)（都是 AGPL-3.0）。用官方的实现而不是
 自己重写 AES-SIV / AES-GCM / scrypt 组合，是为了让**密码学正确性**由上游保证 —— 代价就是本仓库
 整体必须 AGPL-3.0。
+
+> 边界：**scrypt（`cryptolib`）与 AES-SIV（`siv-mode`）用官方的**；自研的是周边那些"写错了会立刻
+> 报错"的部分 —— RFC 3394 密钥解包（正确性由 `versionMac` 反向保证）、base32 / base64url、
+> `masterkey.cryptomator` 的字段读取、以及目录遍历本身。cryptofs 无法进 dex，遍历注定要自己写。
 
 这些库**不入库**：构建时由 `module/tools/fetch-libs.sh` 从本地 Cryptomator 安装目录复制，
 或从 Maven Central 下载。

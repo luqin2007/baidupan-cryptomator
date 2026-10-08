@@ -39,3 +39,4 @@ Thumbs.db
 
 # Oracle tool scratch output (compiled classes)
 tools/oracle/.build/
+tools/p2/.build/
