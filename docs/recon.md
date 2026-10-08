@@ -1516,3 +1516,131 @@ tap 游戏 → 面包屑 [LZPMYUHidTFupQNjAHMN6Fqr-1SA5Q==.c9r, 7HKQI7Z3NKNZLTDH
 - **尺寸列仍是密文大小**：`磁盘 = 68 + 28*ceil(明文/32768) + 明文`（求逆见 12.4/13.5）。
 - **`.c9s` 超长名**未解。
 - **「还原」的返回栈语义**：重定向是 push，back 回到入口指针页（`oncePerPath` 保证不会再被弹走）。
+
+---
+
+## 16. 面包屑、还原，以及「读不到的东西会静默地对上祖先」（`0.11.30-p3w`）
+
+用户在 `0.11.25-p3r` 上试出来的两条，加上它们带出的两条。
+
+### 16.1 还原 → 再解锁 → 点目录：进了指针文件夹（模块级 static 记账）
+
+**现象**：还原一次，再解锁，点 `游戏` → 落在 `…/LZPM…==.c9r`（里面只有一个 `dir.c9r`）并停住。
+同一版本里第一次是好的。
+
+**根因**：重定向的「一个入口只跳一次」记号（原 `Nav.oncePerPath`）是 **模块级 static**，
+**还原不清它**。于是第二次点同一个入口，`add()` 返回 false，看着像"重复"，实际是"这个进程已经跳过了"。
+
+**修法**：记号搬进 `VaultUi.Session.claimRedirect` —— 每个 Session 一份，解锁即重置。
+还原必须是一条能回到起点的路。
+
+### 16.2 面包屑显示格式内部路径（`Crumb.java`）
+
+**现象**：解密根画成 `…/content/d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7`；
+进一层画成 `…/LZPM…==.c9r/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I`。
+
+**修法**：每个 crumb 段按**会话**分类（不是按形态），然后：
+
+| 段 | 处理 |
+|---|---|
+| `d` / 两位桶名 | 隐藏 |
+| `<b64url>.c9r` 指针文件夹 | 隐藏（它后面那段才是名字）|
+| 内容目录 `d/XY/<hash>` | 改成明文名；**根**改成「不显示」 |
+
+「按会话分类」是关键：hash 只有**本会话真的下去过**才算内容目录，桶名只有**已知内容路径走过**才算，
+所以用户自己有个叫 `d` 或 `AB` 的目录不会被误伤。
+
+**显示与逻辑分离**（这一条是承重的）：改过的段同时记下**改之前是什么**（`Crumb.originalOf`），
+`Hooks.crumbPathOf` 读那个。否则 `reconcile` 会被整体挪到一条没人认识的路径上——
+`…/content/RGEQ…`（解密根）和 `…/content`（保险库目录）会变成同一个字符串，
+而所有目录判定都是**后缀匹配**，每个页面的行都会拿错目录的密钥去解。
+
+### 16.3 还原把用户困在里面（按钮消失）
+
+**现象**：还原时若正站在解密树里，按钮是**按"模块能叫出名字的目录"放的**，
+而那个名字来自 session —— 于是密文页上**没有任何按钮**，退不出去。
+（用户没报这条，是 16.1/16.2 的测试撞出来的。）
+
+**修法**：`Session` **保留**，只标记 `locked`。名字还在、解密停了，
+所以树中间的按钮读作「解锁」，点了就在原地重新打开保险库。
+
+**先试过后删掉的做法**：把页面**导航回**保险库目录（`Nav.leaveInterior`）。实测更糟 ——
+App 会加载那个目录的**内容**却不重画它的面包屑，于是页面列着 `d/`、`masterkey.cryptomator`，
+面包屑却还写着刚离开的目录，而**模块的每一个判断都来自面包屑**。
+一条自相矛盾的界面比一个能被理解的状态更糟，所以删了。
+
+### 16.4 面包屑读**文本**会读不到尾巴 —— 然后静默地对上祖先（最隐蔽的一条）
+
+还原给出宽度后，尾部段被挤出屏幕；而 `crumbPathOf` 一直在读 **`TextView` 文本**，
+`RecyclerView` 只保留**放得下的**那些 → 路径**缺尾巴**。
+
+所有目录查找都是**后缀匹配**，所以缺尾巴不会"查不到"，而是**查到祖先**：
+
+```
+[list] bind text=VnAG8qMg…c9r drawn=/crypto/content/RGEQKQVHFPTPFOF65L6I62FLLYWDS7
+       :: dirId="" -> left (decrypt failed: VaultException: entry name does not authenticate)
+```
+
+页面在 `d/DI/7HKQ…`，`drawn` 却退化成 `…/content/RGEQ…`（根），
+于是用**根的 dirId** 去解**子目录**的条目，唯一的迹象是行里一句"解不开"。
+
+**修法**：`crumbPathOf` 改读 **adapter 自己的 item 列表**（`Crumb.wholePath`，
+按字段类型找那个被 R8 改名的 `LinkedList`），那是**完整路径**，与屏幕上放得下什么无关，
+也不受 16.2 的改名影响。文本路线留作别的 App 版本的兜底。
+
+> 顺带记一笔：`androidx.recyclerview` **不在本模块的编译 classpath 上**
+> （只编译 `android.jar` + Xposed stubs），所以 `RecyclerView` 这个类型在这里**写不出来**，
+> 只能 `Reflectx.call0(view, "getAdapter")`。
+
+### 16.5 有了完整路径，还有一类页面是"新会话叫不出名字的"
+
+hash 是**单向**的：刚解锁的 session 只知道根。于是它读不懂自己是从哪一页解锁的
+（实测：行全是密文、按钮被扫掉）。两个互补的答案：
+
+1. **继承**：同一个保险库重新解锁时，新 Session 接管旧 Session 的
+   `dirIdByContent` / `contentByDirId` / `dirIdByAlias` / `nameByDirId`（`inheritFrom`）。
+   **重定向记账故意不继承** —— 那正是 16.1。
+2. **兜底**：`Nav.recoverIfStranded` —— 页面看着在保险库里（含 `.c9r`，或有 `d/XY/<30 位>`）、
+   而 session 叫不出名字，就把它送到解密根（每个 session 都叫得出名字的那个目录）。
+
+### 16.6 实测（`0.11.30-p3w`，**截图**为证）
+
+```
+解锁          → 我的网盘 / crypto / content      列表：游戏、欢迎.rtf      按钮：还原
+点 游戏       → 我的网盘 / crypto / content / 游戏
+                Yunyun Syndrome! Rhythm Psychosis (2026).7z   2.55GB
+                死亡之种2：完全版.7z.006                        1.91GB
+                LUNA PC.zip                                    3.48GB
+还原          → 行回到密文，按钮变「解锁」（页面留在原地）
+再解锁        → 原地恢复上表（会话继承）
+点 content 面包屑 → 回到 游戏 / 欢迎.rtf
+```
+
+日志（折叠与重定向各一条）：
+
+```
+[crumb] 7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I -> 游戏
+[crumb] hid LZPMYUHidTFupQNjAHMN6Fqr-1SA5Q==.c9r (a pointer folder; the crumb after it carries the name)
+[crumb] hid RGEQKQVHFPTPFOF65L6I62FLLYWDS7 (a content directory with no name of its own)
+[nav] the drawn page is the redirect target (dirId "14e74b6d-…", crumb …/LZPM…==.c9r/7HKQ…)
+```
+
+### 16.7 ⚠️ 观测教训：**别用 uiautomator dump 判断这个页面**
+
+窗口里同时存在**四个**文件页副本，`uiautomator dump` **把它们全 dump 出来**。
+本次因此两次误判：
+
+- dump 报按钮文本是「解锁」，**截图**显示的是「还原」；
+- dump 列出密文行，**截图**显示的是明文行。
+
+`ui.py find/get` 都是 dump 之上的，同样不可信。
+**结论：这个页面的验收一律用 `adb exec-out screencap -p`。**（`probe.sh copies` 能看副本归属，但仍不如截图直白。）
+
+### 16.8 仍未做
+
+- **尺寸列仍是密文大小**：`磁盘 = 68 + 28*ceil(明文/32768) + 明文`（求逆见 12.4/13.5）。
+- **`.c9s` 超长名**未解。
+- **还原后停在解密树里、面包屑显示真实密文路径**（`…/content/RGEQ…`）：诚实但不好看，
+  要好看得让 App 真正 pop 回保险库目录 —— `onBackKeyPressed()` 可用（见
+  `recon/p3/dump-…NetDiskFileListFragment.txt`），但 pop 与 push 的差别需要单独验证。
+- **「还原」的返回栈语义**：重定向是 push，back 回到入口指针页（`claimRedirect` 保证不会再被弹走）。
