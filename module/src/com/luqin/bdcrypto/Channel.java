@@ -1,15 +1,19 @@
 package com.luqin.bdcrypto;
 
 import android.app.Activity;
+import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -21,27 +25,37 @@ import de.robv.android.xposed.XposedHelpers;
  * <p>This is P0-B. The question it answers is "given a cloud file, which call produces its bytes",
  * and the answer cannot come from a disassembler: every class in the pipeline is method-obfuscated
  * ({@code f}, {@code l}, {@code __}), and the one type that would let us be self-sufficient —
- * {@code IDownloadProcessorFactory} — returns an <em>abstract class</em>
- * ({@code com.baidu.netdisk.transfer.base.Processor}, one abstract method {@code _()}), so it
- * cannot be satisfied by a {@code java.lang.reflect.Proxy} and cannot be subclassed at runtime
- * without generating bytecode. Neither can a {@code TaskResultReceiver} be invented: it extends
- * {@code WeakRefResultReceiver} and its whole job is to be called back by machinery we do not own.
+ * {@code com.baidu.netdisk.transfer.task.IDownloadProcessorFactory} — returns an <em>abstract
+ * class</em> ({@code com.baidu.netdisk.transfer.base.Processor}), so it cannot be satisfied by a
+ * {@code java.lang.reflect.Proxy} and cannot be subclassed at runtime without generating bytecode.
+ * Neither can a {@code TaskResultReceiver} be invented: its whole job is to be called back by
+ * machinery we do not own.
  *
  * <p>So the objects are borrowed instead of built. The app produces a factory, a receiver and the
  * manager instance on every real download; this class keeps the ones it sees, and a later call can
  * be made with them. That is the whole design: observe once, replay after.
  *
- * <p>Two deliberate differences from {@code Hooks.hookDownloadPipeline}:
- * <ul>
- *   <li>That hook is capped at {@code MAX_CHANNEL_LOGS} raw lines, and the app makes hundreds of
- *       {@code [dl]} calls before any download starts, so the interesting line is exactly the one
- *       that gets dropped. Here every call is keyed by its <em>signature</em> — declaring class,
- *       method name, parameter types — and a signature is logged the first time it is ever seen.
- *       Volume therefore cannot hide it.</li>
- *   <li>That hook logs only rendered arguments. Here {@code IDownloadProcessorFactory},
- *       {@code TaskResultReceiver}, {@code CloudFile} and {@code Activity} arguments are also
- *       <em>retained</em>, because retaining them is the point.</li>
- * </ul>
+ * <h2>Why recognition is by type, not by name</h2>
+ *
+ * <p>The first version of this class matched on class-name suffixes
+ * ({@code cn.endsWith("IDownloadProcessorFactory")}). On the first real download
+ * ({@code 2026-10-08 08:58}) that captured 37 distinct call signatures and still produced
+ * {@code factory = null}, because the object the app passes is an R8-moved class named
+ * {@code no0.___}. A name test can never see it. The interface is real and unchanged —
+ * {@code com.baidu.netdisk.transfer.task.IDownloadProcessorFactory} is in the shipped dex — so the
+ * fix is to walk the superclass-and-interface graph and match on <em>types</em>.
+ *
+ * <p>Two consequences worth keeping: the shipped class index omits obfuscated top-level packages
+ * entirely (see {@code module/tools/gen_class_index.py}), and a class name is not evidence of
+ * anything in an R8 build.
+ *
+ * <h2>Independent of the capture</h2>
+ *
+ * <p>A real download also proves the destination layout without any of the above: the app writes
+ * {@code /storage/emulated/0/Download/BaiduNetdisk/<cloud path>}, and on 2026-10-08 the bytes
+ * pulled from there were sha256-identical to the desktop copy of the vault
+ * ({@code vault.cryptomator} 283 B, {@code 5b8dd122…}). So a replay is verifiable by pulling the
+ * file it produces, not only by reading a log.
  */
 public final class Channel {
 
@@ -67,6 +81,8 @@ public final class Channel {
     private static volatile Object lastReceiver; // TaskResultReceiver
     private static volatile Object lastActivity; // Activity
     private static volatile String lastTrigger = "-";
+    private static volatile String factoryTrigger = "-";
+    private static volatile String receiverTrigger = "-";
 
     /** The last {@code N} CloudFiles the list handed us, so a replay has something to download. */
     private static final int MAX_FILES = 200;
@@ -95,8 +111,7 @@ public final class Channel {
             int n = 0;
             for (Method m : safeMethods(c)) {
                 int mod = m.getModifiers();
-                if (java.lang.reflect.Modifier.isAbstract(mod)
-                        || java.lang.reflect.Modifier.isNative(mod)) {
+                if (Modifier.isAbstract(mod) || Modifier.isNative(mod)) {
                     continue;
                 }
                 try {
@@ -139,13 +154,26 @@ public final class Channel {
     // ------------------------------------------------------------ typing ----
 
     private static void note(XC_MethodHook.MethodHookParam p) {
-        String owner = p.method == null ? "?" : p.method.getDeclaringClass().getName();
-        String name = p.method == null ? "?" : p.method.getName();
+        boolean ctor = p.method == null;
+        String owner = ctor
+                ? (p.thisObject == null ? "?" : p.thisObject.getClass().getName())
+                : p.method.getDeclaringClass().getName();
+        String name = ctor ? "<init>" : p.method.getName();
         Object[] args = p.args == null ? new Object[0] : p.args;
 
-        // Retain the objects the pipeline hands around. This is the capture.
+        // Retain the objects the pipeline hands around. This is the capture. Note that the
+        // *instance* and the *result* count too: the factory for a whole download is the return
+        // value of FDDownloadManagerApi.q, and the manager is only ever seen as a fresh `this`.
         for (Object a : args) {
             retain(a, owner, name);
+        }
+        retain(p.thisObject, owner, name);
+        if (!ctor) {
+            try {
+                retain(p.getResult(), owner, name);
+            } catch (Throwable ignored) {
+                // getResult on a void method is null; nothing to retain.
+            }
         }
 
         // Key by signature, not by call: the app makes hundreds of uninteresting calls before the
@@ -171,6 +199,50 @@ public final class Channel {
         }
     }
 
+    // ------------------------------------------------- object recognition ---
+
+    private static final String[] T_FACTORY = {"IDownloadProcessorFactory", "IUploadProcessorFactory"};
+    private static final String[] T_RECEIVER = {"TaskResultReceiver"};
+    private static final String[] T_MANAGER = {"DownloadTaskManager"};
+    private static final String[] T_API = {"FDDownloadManagerApi"};
+    private static final String[] T_HELPER = {"SingleFileDownloadHelper"};
+    private static final String[] T_EXT_HELPER = {"ExternalDownloadHelper"};
+
+    /**
+     * Is {@code c}, or anything it extends or implements, one of these types?
+     *
+     * <p>This is the whole point of the rewrite: an R8 build renames the <em>class</em> but cannot
+     * change the type graph, so {@code no0.___ implements IDownloadProcessorFactory} is visible
+     * here even though its name says nothing.
+     */
+    private static boolean isA(Class<?> c, String[] want) {
+        return isA(c, want, 0);
+    }
+
+    private static boolean isA(Class<?> c, String[] want, int depth) {
+        if (c == null || c == Object.class || depth > 32) {
+            return false;
+        }
+        String n = c.getName();
+        for (String w : want) {
+            if (n.endsWith(w)) {
+                return true;
+            }
+        }
+        Class<?>[] ifs;
+        try {
+            ifs = c.getInterfaces();
+        } catch (Throwable t) {
+            ifs = new Class<?>[0];
+        }
+        for (Class<?> i : ifs) {
+            if (isA(i, want, depth + 1)) {
+                return true;
+            }
+        }
+        return isA(c.getSuperclass(), want, depth + 1);
+    }
+
     /**
      * Keeps the handful of objects a replay needs, and names anything else that is obviously part
      * of the pipeline so the shape of a real download is visible in the log.
@@ -179,29 +251,29 @@ public final class Channel {
         if (a == null) {
             return;
         }
-        String cn = a.getClass().getName();
-        if (cn.endsWith("IDownloadProcessorFactory") || cn.endsWith("DownloadProcessorFactory")) {
+        Class<?> c = a.getClass();
+        if (isA(c, T_FACTORY)) {
             if (lastFactory != a) {
                 lastFactory = a;
-                lastTrigger = owner + "." + name;
-                Logx.i("[ch#factory] borrowed IDownloadProcessorFactory from " + lastTrigger
-                        + " -> " + cn);
+                factoryTrigger = owner + "." + name;
+                Logx.i("[ch#factory] borrowed factory from " + factoryTrigger + " -> " + c.getName());
             }
-        } else if (cn.endsWith("TaskResultReceiver")) {
+        } else if (isA(c, T_RECEIVER)) {
             if (lastReceiver != a) {
                 lastReceiver = a;
-                Logx.i("[ch#receiver] borrowed TaskResultReceiver from " + owner + "." + name
-                        + " -> " + cn);
+                receiverTrigger = owner + "." + name;
+                Logx.i("[ch#receiver] borrowed receiver from " + receiverTrigger + " -> "
+                        + c.getName());
             }
         } else if (a instanceof Activity) {
             lastActivity = a;
-        } else if (cn.endsWith("DownloadTaskManager")) {
+        } else if (isA(c, T_MANAGER)) {
             manager = a;
-        } else if (cn.endsWith("FDDownloadManagerApi")) {
+        } else if (isA(c, T_API)) {
             api = a;
-        } else if (cn.endsWith("SingleFileDownloadHelper")) {
+        } else if (isA(c, T_HELPER)) {
             helper = a;
-        } else if (cn.endsWith("ExternalDownloadHelper")) {
+        } else if (isA(c, T_EXT_HELPER)) {
             extHelper = a;
         }
     }
@@ -211,10 +283,13 @@ public final class Channel {
         if (o == null) {
             return;
         }
-        for (Object e : files) {
-            if (e == o) {
-                return;
-            }
+        // Must be a synchronised *method* call, not a for-each: row binding happens on the main
+        // thread and on binder threads at once, and iterating a synchronizedList outside its own
+        // lock throws ConcurrentModificationException. That is not theoretical — it surfaced as
+        // "hook body failed: CloudFile.readFromCursor :: java.util.ConcurrentModificationException"
+        // during the 08:58 download.
+        if (files.contains(o)) {
+            return;
         }
         if (files.size() >= MAX_FILES) {
             files.remove(0);
@@ -258,7 +333,7 @@ public final class Channel {
                     + " size=" + Reflectx.callLong(o, "getSize", -1L)
                     + " dir=" + Reflectx.callBool(o, "isDir", false) + "}";
         }
-        if (cn.startsWith("java.util.") && o instanceof List) {
+        if (o instanceof List) {
             List<?> l = (List<?>) o;
             StringBuilder sb = new StringBuilder("List(").append(l.size()).append(")[");
             for (int i = 0; i < l.size() && i < 3; i++) {
@@ -273,25 +348,46 @@ public final class Channel {
         if (p.hasThrowable()) {
             return "  !! " + p.getThrowable();
         }
-        Object r = p.getResult();
+        Object r;
+        try {
+            r = p.getResult();
+        } catch (Throwable t) {
+            return "  -> (unavailable)";
+        }
         return r == null ? "  -> void/null" : "  -> " + brief(r);
     }
 
     // ------------------------------------------------------------- probe ----
 
-    /** {@code ch} probe: {@code last} | {@code files} | {@code go <n|name> [flag]}. */
-    public static String command(String arg) {
+    /** {@code ch} probe: {@code last} | {@code files} | {@code hier} | {@code go <n|name> [flag]}. */
+    public static String command(Context ctx, String arg) {
         String a = arg == null ? "" : arg.trim();
+        String body;
         if (a.isEmpty() || "last".equalsIgnoreCase(a)) {
-            return report();
+            body = report();
+        } else if ("files".equalsIgnoreCase(a)) {
+            body = fileList();
+        } else if ("hier".equalsIgnoreCase(a)) {
+            body = hierarchies();
+        } else if (a.startsWith("go")) {
+            body = replay(a.length() > 2 ? a.substring(2).trim() : "");
+        } else {
+            body = "ch: unknown argument '" + a + "' (last | files | hier | go <n|name> [flag])";
         }
-        if ("files".equalsIgnoreCase(a)) {
-            return fileList();
+        // The LSPosed log truncates a single record at ~7.6 KB, which silently ate the tail of the
+        // 37-signature list. A file has no such limit.
+        if (ctx != null && body != null && body.length() > 400) {
+            String path = Report.write(ctx, "ch.txt", body);
+            Logx.i(head(body) + "\n… (" + body.length() + " chars, full text in " + path + ")");
+        } else {
+            Logx.i(body);
         }
-        if (a.startsWith("go")) {
-            return replay(a.length() > 2 ? a.substring(2).trim() : "");
-        }
-        return "ch: unknown argument '" + a + "' (last | files | go <n|name> [flag])";
+        return body;
+    }
+
+    private static String head(String s) {
+        int n = Math.min(s.length(), 3600);
+        return s.substring(0, n);
     }
 
     private static String report() {
@@ -302,26 +398,76 @@ public final class Channel {
         sb.append("  extHelper    : ").append(typeName(extHelper)).append('\n');
         sb.append("  activity     : ").append(typeName(lastActivity)).append('\n');
         sb.append("  factory      : ").append(typeName(lastFactory))
-                .append("  (from ").append(lastTrigger).append(")\n");
-        sb.append("  receiver     : ").append(typeName(lastReceiver)).append('\n');
+                .append("  (from ").append(factoryTrigger).append(")\n");
+        sb.append("  receiver     : ").append(typeName(lastReceiver))
+                .append("  (from ").append(receiverTrigger).append(")\n");
         sb.append("  files held   : ").append(files.size()).append('\n');
-        sb.append("  distinct call signatures: ").append(sigs.size()).append('\n');
-        int shown = 0;
-        for (String s : sigs) {
-            if (shown++ >= 60) {
-                sb.append("  … ").append(sigs.size() - 60).append(" more\n");
-                break;
-            }
-            sb.append("    ").append(s).append('\n');
-        }
-        if (sigs.isEmpty()) {
+        List<String> snapshot = new ArrayList<String>(sigs);
+        sb.append("  distinct call signatures: ").append(snapshot.size()).append('\n');
+        if (snapshot.isEmpty()) {
             sb.append("    (none — no download has been attempted in this process)\n");
+        }
+        for (String s : snapshot) {
+            sb.append("    ").append(cut(s)).append('\n');
         }
         return sb.toString();
     }
 
+    /** One report line must stay readable; the args of a long signature are already truncated. */
+    private static String cut(String s) {
+        return s.length() <= 400 ? s : s.substring(0, 400) + "…";
+    }
+
     private static String typeName(Object o) {
         return o == null ? "<null>" : o.getClass().getName();
+    }
+
+    /** The type graph of every captured actor — the only way to read an R8-renamed class. */
+    private static String hierarchies() {
+        StringBuilder sb = new StringBuilder("captured actor types\n");
+        actor(sb, "manager", manager);
+        actor(sb, "api", api);
+        actor(sb, "helper", helper);
+        actor(sb, "extHelper", extHelper);
+        actor(sb, "activity", lastActivity);
+        actor(sb, "factory", lastFactory);
+        actor(sb, "receiver", lastReceiver);
+        return sb.toString();
+    }
+
+    private static void actor(StringBuilder sb, String label, Object o) {
+        sb.append("\n  ").append(label).append(" : ").append(typeName(o)).append('\n');
+        if (o == null) {
+            return;
+        }
+        Set<Class<?>> seen = new HashSet<Class<?>>();
+        for (Class<?> k = o.getClass().getSuperclass(); k != null && k != Object.class;
+             k = k.getSuperclass()) {
+            sb.append("      extends    ").append(k.getName()).append('\n');
+        }
+        ifaces(sb, o.getClass(), seen, 1);
+        for (String[] want : new String[][]{T_FACTORY, T_RECEIVER, T_MANAGER, T_API, T_HELPER,
+                T_EXT_HELPER}) {
+            if (isA(o.getClass(), want)) {
+                sb.append("      matches    ").append(want[0]).append('\n');
+            }
+        }
+    }
+
+    private static void ifaces(StringBuilder sb, Class<?> c, Set<Class<?>> seen, int depth) {
+        if (c == null || depth > 4 || !seen.add(c)) {
+            return;
+        }
+        Class<?>[] ifs;
+        try {
+            ifs = c.getInterfaces();
+        } catch (Throwable t) {
+            return;
+        }
+        for (Class<?> i : ifs) {
+            sb.append("      implements ").append(i.getName()).append('\n');
+            ifaces(sb, i, seen, depth + 1);
+        }
     }
 
     private static String fileList() {
@@ -350,15 +496,15 @@ public final class Channel {
     // ------------------------------------------------------------ replay ----
 
     /**
-     * Starts a real download of a held CloudFile using the borrowed factory and receiver.
+     * Starts a real download of a held CloudFile using objects borrowed from a previous one.
      *
-     * <p>Deliberately runs on a background thread: this is called from the probe thread already, and
-     * the pipeline is free to be slow — but nothing here may run on the main thread, because the
-     * replay is meant to be usable while the app is busy painting a list.
+     * <p>Runs on the main thread: {@code FDDownloadManagerApi.g} takes an {@code Activity}, so it
+     * is entitled to touch UI, and enqueuing a task is cheap. A latch with a timeout keeps the
+     * probe from hanging if a candidate entry point blocks.
      */
     private static String replay(String spec) {
         String[] parts = spec.split("\\s+");
-        String which = parts.length > 0 ? parts[0] : "";
+        final String which = parts.length > 0 ? parts[0] : "";
         int flag = 0;
         if (parts.length > 1) {
             try {
@@ -370,6 +516,34 @@ public final class Channel {
         if (which.isEmpty()) {
             return "ch go: give a file index or name (ch files)";
         }
+        final int f = flag;
+
+        final String[] out = new String[1];
+        final CountDownLatch done = new CountDownLatch(1);
+        mainHandler().post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    out[0] = replayOnMain(which, f);
+                } catch (Throwable t) {
+                    out[0] = "ch go: threw " + t;
+                } finally {
+                    done.countDown();
+                }
+            }
+        });
+        try {
+            if (!done.await(30, TimeUnit.SECONDS)) {
+                return "ch go: still running on the main thread after 30 s";
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "ch go: interrupted";
+        }
+        return out[0] == null ? "ch go: no result" : out[0];
+    }
+
+    private static String replayOnMain(String which, int flag) {
         List<Object> copy = new ArrayList<Object>(files);
         Object target = null;
         try {
@@ -385,48 +559,168 @@ public final class Channel {
                 }
             }
         }
+        StringBuilder sb = new StringBuilder("ch go:\n");
         if (target == null) {
-            return "ch go: no held CloudFile matches '" + which + "' (" + copy.size() + " held)";
+            return sb.append("  no held CloudFile matches '").append(which).append("' (")
+                    .append(copy.size()).append(" held; try 'ch files')\n").toString();
         }
-        if (lastFactory == null || lastReceiver == null) {
-            return "ch go: no factory/receiver borrowed yet — perform one real download first "
-                    + "(factory=" + typeName(lastFactory) + " receiver=" + typeName(lastReceiver) + ")";
+        String fileName = Reflectx.callStr(target, "getFileName");
+        List<Object> list = new ArrayList<Object>();
+        list.add(target);
+        sb.append("  file=").append(fileName)
+                .append("  size=").append(Reflectx.callLong(target, "getSize", -1L))
+                .append("  path=").append(Reflectx.callStr(target, "getFilePath")).append('\n');
+
+        // --- factory: prefer one the app already made; otherwise ask the app's own API to make one.
+        Object factory = lastFactory;
+        sb.append("  factory: ").append(typeName(factory))
+                .append(factory == null ? "" : " (borrowed from " + factoryTrigger + ")").append('\n');
+        if (factory == null && api != null) {
+            Att a = invoke(api, new String[]{"q"}, new Object[]{list, flag, null, null});
+            sb.append("  api.q(list, ").append(flag).append(", null, null) -> ").append(a).append('\n');
+            if (a.ret != null) {
+                factory = a.ret;
+            }
         }
-        if (manager == null) {
-            return "ch go: no DownloadTaskManager instance captured yet";
+        Object receiver = lastReceiver;
+        sb.append("  receiver: ").append(typeName(receiver))
+                .append(receiver == null ? "" : " (borrowed from " + receiverTrigger + ")"); 
+        sb.append('\n');
+
+        // --- then replay, trying each entry point the app itself was observed to use.
+        if (manager != null) {
+            sb.append("  --- via DownloadTaskManager (this is what the app itself called) ---\n");
+            if (attempt(sb, manager, "d", new Object[]{list, factory, receiver, flag})
+                    || attempt(sb, manager, "e", new Object[]{list, factory, receiver, flag, null})
+                    || attempt(sb, manager, "f", new Object[]{target, factory, receiver, flag})) {
+                return sb.append("  result: an entry point accepted the task\n").toString();
+            }
         }
-        StringBuilder sb = new StringBuilder("ch go: ");
-        sb.append("file=").append(Reflectx.callStr(target, "getFileName"))
-                .append(" flag=").append(flag).append('\n');
-        sb.append(run(manager, "f", new Object[]{target, lastFactory, lastReceiver, flag},
-                "DownloadTaskManager.f"));
-        return sb.toString();
+        if (api != null && lastActivity != null) {
+            sb.append("  --- via FDDownloadManagerApi ---\n");
+            if (attempt(sb, api, "g",
+                    new Object[]{lastActivity, Boolean.TRUE, list, factory, null, flag})
+                    || attempt(sb, api, "______",
+                    new Object[]{lastActivity, Boolean.TRUE, list, factory, null, flag, null})
+                    || attempt(sb, api, "c",
+                    new Object[]{lastActivity, list, flag, 0, Boolean.TRUE, null, null, null, null,
+                            null})) {
+                return sb.append("  result: an entry point accepted the task\n").toString();
+            }
+        }
+        return sb.append("  result: every entry point refused (see the lines above)\n").toString();
     }
 
-    /** Invokes the first method of that name, whatever its parameters, and reports the outcome. */
-    private static String run(Object instance, String method, Object[] args, String label) {
+    /** Tries one method name; returns true only if a matching overload ran without throwing. */
+    private static boolean attempt(StringBuilder sb, Object instance, String name, Object[] args) {
+        Att a = invoke(instance, new String[]{name}, args);
+        sb.append("  ").append(Reflectx.simple(instance.getClass().getName())).append('.').append(name)
+                .append('(').append(args.length).append(" args) -> ").append(a).append('\n');
+        return a.ok;
+    }
+
+    private static final class Att {
+        boolean ok;
+        Object ret;
+        String note = "not found";
+
+        @Override
+        public String toString() {
+            return note;
+        }
+    }
+
+    /**
+     * Invokes the first overload of any of {@code names} whose parameters can actually accept
+     * {@code args}. Argument types matter here: {@code d} and {@code f} both take four arguments
+     * but {@code f} wants an {@code IDownloadable}, not an {@code ArrayList}.
+     */
+    private static Att invoke(Object instance, String[] names, Object[] args) {
+        Att att = new Att();
         if (instance == null) {
-            return "  " + label + ": no instance\n";
+            att.note = "no instance";
+            return att;
         }
         for (Class<?> k = instance.getClass(); k != null; k = k.getSuperclass()) {
             for (Method m : safeMethods(k)) {
-                if (!m.getName().equals(method)) {
+                if (!nameIn(m.getName(), names)) {
                     continue;
                 }
-                if (m.getParameterTypes().length != args.length) {
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length != args.length) {
+                    continue;
+                }
+                if (!accepts(ps, args)) {
+                    att.note = "no overload accepts these arguments";
                     continue;
                 }
                 try {
                     m.setAccessible(true);
                     Object r = m.invoke(instance, args);
-                    return "  " + label + " -> ok, result=" + brief(r) + "\n";
+                    att.ok = true;
+                    att.ret = r;
+                    att.note = "ok, returned " + brief(r);
                 } catch (Throwable t) {
-                    Throwable cause = t.getCause() == null ? t : t.getCause();
-                    return "  " + label + " !! " + cause + "\n";
+                    Throwable c = t.getCause() == null ? t : t.getCause();
+                    att.ok = false;
+                    att.note = "threw " + c;
                 }
+                return att;
             }
         }
-        return "  " + label + ": method not found\n";
+        return att;
+    }
+
+    private static boolean nameIn(String n, String[] names) {
+        for (String x : names) {
+            if (x.equals(n)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean accepts(Class<?>[] ps, Object[] args) {
+        for (int i = 0; i < ps.length; i++) {
+            if (args[i] == null) {
+                continue;
+            }
+            if (!boxed(ps[i]).isInstance(args[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static Class<?> boxed(Class<?> c) {
+        if (!c.isPrimitive()) {
+            return c;
+        }
+        if (c == int.class) {
+            return Integer.class;
+        }
+        if (c == long.class) {
+            return Long.class;
+        }
+        if (c == boolean.class) {
+            return Boolean.class;
+        }
+        if (c == short.class) {
+            return Short.class;
+        }
+        if (c == byte.class) {
+            return Byte.class;
+        }
+        if (c == char.class) {
+            return Character.class;
+        }
+        if (c == float.class) {
+            return Float.class;
+        }
+        if (c == double.class) {
+            return Double.class;
+        }
+        return c;
     }
 
     /** A main-thread Handler, for anything that must touch the UI. */

@@ -86,7 +86,7 @@ public final class Probe {
         } else if ("copies".equals(cmd)) {
             Logx.i(Hooks.copiesReport("probe"));
         } else if ("ch".equals(cmd)) {
-            Logx.i(Channel.command(arg));
+            Channel.command(ctx, arg);
         } else {
             Logx.w("unknown cmd: " + cmd);
             help();
@@ -112,6 +112,8 @@ public final class Probe {
                 + "  ch [arg]                  content channel (P0-B)\n"
                 + "                              last   - what was captured, and every distinct call\n"
                 + "                              files  - CloudFiles held from the list, for a replay\n"
+                + "                              hier   - the type graph of each captured object\n"
+                + "                                       (the only way to read an R8-renamed class)\n"
                 + "                              go <n|name> [flag] - download one of them for real\n"
                 + "  state                     one-line summary of what has been captured\n"
                 + "  ls | clear                list / delete probe report files");

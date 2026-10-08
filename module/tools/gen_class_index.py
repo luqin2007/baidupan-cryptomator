@@ -11,7 +11,15 @@ The file is a dev aid: the probe degrades to "index asset missing" without it.
 
 Usage
 -----
-    python module/tools/gen_class_index.py <dir-with-classes*.dex> [output.gz]
+    python module/tools/gen_class_index.py <dir-with-classes*.dex> [output.gz] [prefix]
+
+``prefix`` defaults to **every** class in the dex. It used to be hard-coded to
+``com/baidu/netdisk/``, which turned out to be a silent blind spot of exactly the wrong
+kind: R8 moves whole classes into obfuscated top-level packages (``no0``, ``x22``,
+``j$``, ``dx0``, ``bx`` …) and those are precisely the ones worth looking up. The search
+for the download factory returned nothing until it was found in a runtime dump as
+``no0.___`` — a class the index did not contain, even though it is in the shipped dex.
+174,938 descriptors ship; the old filter kept 53,482 of them.
 
 Provenance: <dir> is produced by
     adb shell pm path com.baidu.drive.app   -> base.apk
@@ -25,7 +33,7 @@ import os
 import struct
 import sys
 
-PREFIX = "com/baidu/netdisk/"
+PREFIX = ""  # see the module docstring: empty means "index everything"
 
 
 def uleb128(buf: bytes, off: int):
@@ -69,6 +77,7 @@ def main(argv):
     dexdir = argv[1]
     out = argv[2] if len(argv) > 2 else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..", "assets", "app_classes.txt.gz")
+    prefix = argv[3] if len(argv) > 3 else PREFIX
     out = os.path.normpath(out)
 
     files = sorted(glob.glob(os.path.join(dexdir, "*.dex")))
@@ -78,7 +87,7 @@ def main(argv):
 
     names: set[str] = set()
     for f in files:
-        names |= class_names(f, PREFIX)
+        names |= class_names(f, prefix)
     blob = "\n".join(sorted(names)) + "\n"
 
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -86,7 +95,7 @@ def main(argv):
         gz.write(blob.encode("utf-8"))
 
     print("dex files : %d" % len(files))
-    print("classes   : %d  (prefix %s)" % (len(names), PREFIX))
+    print("classes   : %d  (prefix %r)" % (len(names), prefix or "<all>"))
     print("raw bytes : %d" % len(blob))
     print("gzip bytes: %d  -> %s" % (os.path.getsize(out), out))
     return 0

@@ -677,7 +677,7 @@ scrypt(CharSequence passphrase, byte[] scryptSalt, byte[] pepper, int cost, int 
 复现工具已入库：`tools/oracle/`（`oracle.sh check|unlock`），
 `tools/oracle/README.md` 记了这两个陷阱。
 
-### 11.5 阻塞点：下载需要存储权限
+### 11.5 阻塞点：下载需要存储权限（已解决）
 
 真实触发一次下载（`/crypto/content` → 多选 `vault.cryptomator` → 底部栏「下载」）时，
 App 弹出：
@@ -688,8 +688,22 @@ App 弹出：
 [允许]  [不允许]
 ```
 
-**未授权之前不会发生任何下载**，`[ch#new]` 一条都不会有 —— 也就借不到 factory/receiver，
-重放无法进行。是否授予该权限由用户决定。
+**未授权之前不会发生任何下载**，`[ch#new]` 一条都不会有 —— 也就借不到 factory/receiver。
+（是否授予该权限由用户决定；用户于 2026-10-08 08:58 授权后，同日 09:20 验证通过，见 §11.7。）
+
+授权后顺带得到一个**独立于捕获层**的事实，它比捕获本身更省事：
+
+> **App 的下载落点是确定性的**：`/storage/emulated/0/Download/BaiduNetdisk/<云端相对路径>`。
+> 2026-10-08 用户下载的三个文件，`adb pull` 回来与本机桌面版副本 **sha256 完全相同**：
+
+| 文件 | 大小 | sha256（两端一致） |
+|---|---|---|
+| `vault.cryptomator` | 283 B | `5b8dd1226a37cc8f776896ade6fde94d6a017a67b11db7e8af9ef2c729c0291a` |
+| `masterkey.cryptomator` | 329 B | `45d625f66a9989752b682a4b2d421d313fa1277b34e76773212664746b72aa52` |
+| `重要.rtf` | 1296 B | `3d8214e2176b7c671669bb1e8b2756a8d1660aef1c3e0f3fb94e4218a9337e38` |
+
+这条路径是 **P3（下载自动解密）** 的天然接口：密文已经躺在本地了，模块只需要在下载完成后
+就地解密覆盖，不必自己再造一条下载通道。
 
 ### 11.6 操作事实（这一轮踩到的）
 
@@ -701,37 +715,128 @@ App 弹出：
   于是 `uiautomator dump` 写到了本地一个不存在的目录、`adb shell cat` 什么都读不到。
   这类参数要带 `MSYS_NO_PATHCONV=1`。反过来，`javac`/`aapt2` 这类原生 exe 又**必须**给
   `C:/…` 形式（`cygpath -m`）。
+- **带空格的广播参数会在设备侧被再切一次**：`--es arg "go 18"` 到了设备变成 `--es arg go 18`，
+  探针只收到 `go`。所以命令参数**不留空格**（`ch go18`），在 `Channel.command` 里按
+  `startsWith("go")` 解析。
+- **`su -c '… "a\|b" …'` 里的交替会被吃掉**：嵌套引号下 grep 的 `\|` 时灵时不灵，
+  浪费过两轮。改成**把日志 `cat` 回本地再 grep**（3 MB，一秒），从此不在远端做正则。
+- **toybox `ls` 没有 `--time-style`**，`find -newermt` 也不可靠；判断"文件是不是新的"直接看
+  `ls -la` 的 mtime。
+- **`input` 没有 longpress**：长按 = 起点终点同一像素的 `input swipe x y x y 900`。
+  `tools/ui.py long <regex>` 即此。
+- 多选底部栏的「下载」按钮与列表行里的「已下载」**共享子串**，正则必须锚定（`^下载$`），
+  否则会点到「已下载」那三个字的行上。
 
-### 11.7 解封步骤（下次开工从这里接）
+### 11.7 P0-B 完成：观察一次、之后重放（`0.10.1-p0b2`，2026-10-08 09:20）
 
-设备上装的是 `0.10.0-p0b`（versionCode 14），`Channel.install` 已在**两个进程**成功装上：
-`DownloadTaskManager (44)` / `FDDownloadManagerApi (52)` / `SingleFileDownloadHelper (5)` /
-`ExternalDownloadHelper (10)` / `TaskResultReceiver (8)`。捕获层是好的，缺的只是"让它看见一次真的下载"。
+#### 结论
 
-1. **先在 App 里点「允许」**授予存储权限。这一步必须由人来做，模块不会去代点。
-2. `/crypto/content` → 多选 `vault.cryptomator` → 底部栏「下载」。
-   注意别点行右侧的「更多」：那会落到行本身、进多选模式（曾经这样误触过一次）。
-   真正的下载会解出一颗小文件，成本可忽略。
-3. 验证重放通道：
-   ```bash
-   ./probe.sh ch last     # 应出现 [ch#new]，记下 manager/factory/receiver 是否已持有
-   ./probe.sh ch files    # 列表里被 hold 住的 CloudFile
-   ./probe.sh ch go 0     # 用借来的 factory/receiver 重放一次
-   ```
-   `[ch#new]` 一条都没有 = 观察这一步没发生，此时**不要**去看重放（重放依赖观察的结果）。
-4. **P0-B 的完成标准（Task #9）**：把 `vault.cryptomator` 整个读出来，与
-   `D:\cryptomator\baidu\vault.cryptomator` **逐字节比对**。期望值不用猜，直接由 oracle 给出：
-   ```bash
-   bash tools/oracle/oracle.sh unlock /d/cryptomator/baidu 'f_EqfhYmWxAMq!!dmL_3'
-   ```
-   （口令已由 `oracle.sh check` 的 `versionMac` 逐字节确认。）
+模块能**自己**把云端文件的字节拿到手。验证方式是取两个**从未下载过**的保险库密文文件，
+让模块自行触发下载，再与桌面版逐字节比对：
 
-### 11.8 下一阶段开工前要先补的一件事
+| 文件 | 大小 | sha256（模块自行取得 vs 桌面真值） |
+|---|---|---|
+| `d/SY/RGEQ…/dirid.c9r` | 96 B | `c09b7632fa9e5849d729b2f4a601f6037151c2ad610cf2a4111b6bd1720fcc43` |
+| `d/SY/RGEQ…/kymd3…pQ=.c9r` | 916 B | `30b1fb2b5a7ccd576030d51ac35c26d2d5cba21cb5f0671103106f699db9ab51` |
 
-当前保险库太稀疏（**1 个目录、1 个文件**，即 `欢迎.rtf` 820 B），
-P2 要验的**中文名 / 超长名 / 多级目录 / >32 KiB 多 chunk** 一个都覆盖不到 ——
-这属于 P0-D「造一个内容更丰富的测试保险库」。**先补保险库，再写 P2**，
-否则 P2 的"与桌面版逐条对照"没有对照物。
+两个文件均 `cmp` 报 **IDENTICAL**。落点是
+`/storage/emulated/0/Download/BaiduNetdisk/crypto/content/d/…`（即 §11.5 的确定性路径）。
+
+#### 让捕获真正生效的两个 bug（都是"名字当类型用"）
+
+`0.10.0-p0b` 在 08:58 那次真实下载里**看见了 37 个不同签名**，却仍然报
+`factory = null / receiver = null`。原因不是观察失败，是**识别方式错了**：
+
+```java
+// 0.10.0-p0b —— 永远不可能命中
+String cn = a.getClass().getName();
+if (cn.endsWith("IDownloadProcessorFactory")) { ... }
+```
+
+R8 会把类搬到混淆的顶层包里。运行时的真实身份是：
+
+```
+factory  : no0.___
+             implements com.baidu.netdisk.transfer.task.IDownloadProcessorFactory
+receiver : com.baidu.netdisk.file.download.component.apis.FDDownloadManagerApi$addDownloadListTaskReality$newReceiver$1
+             extends    com.baidu.netdisk.transfer.task.TaskResultReceiver
+             extends    com.baidu.netdisk.kernel.android.ext.WeakRefResultReceiver
+             extends    android.os.ResultReceiver
+```
+
+**名字在 R8 构建里不是证据，类型图才是。** `0.10.1-p0b2` 改为沿继承链 + 接口图递归匹配
+（`Channel.isA`），`ch hier` 就是用来把这张图打出来的。
+
+第二个 bug：`retain()` 只遍历 `p.args`，**从不看 `p.thisObject` 与返回值**。而
+- `api`（`FDDownloadManagerApi`）只在构造时以 `this` 出现；
+- `factory` 是 `FDDownloadManagerApi.q(...)` 的**返回值**。
+
+补上之后 `manager` / `api` / `activity` / `factory` / `receiver` 五项全部到手。
+
+#### 顺带修掉的两个真实缺陷
+
+- **`CloudFile.readFromCursor` 崩溃**：日志里 `hook body failed … ConcurrentModificationException`。
+  根因是 `noteFile()` 用 for-each 遍历 `Collections.synchronizedList` —— 行绑定在**主线程与
+  binder 线程**上并发发生，迭代器不带锁。改为 `files.contains(o)`（同步的**方法**调用）。
+- **报告被截断**：LSPosed 把单条多行记录截到 ~7.6 KB，第一次 `ch last` 的 37 条签名清单
+  尾巴就是这么丢的。现在正文超 400 字符就落盘 `ch.txt`，日志只留指针。
+
+#### 重放的实际形态
+
+`ch go <n|name>` 在**主线程**上跑（`FDDownloadManagerApi.g` 收 `Activity`，有权碰 UI；
+入队本身很便宜），按 App 自己出现过的调用链逐个尝试并汇报每一步结果：
+
+```
+DownloadTaskManager.d  ← App 自己在 08:58 调的就是它
+DownloadTaskManager.e / .f
+FDDownloadManagerApi.g / .______ / .c
+```
+
+成功判据**不是**"没抛异常"，而是**目标路径上真的出现了那个文件** ——
+`manager.d` 返回 null 也可能只是被去重跳过（已下载过的文件就是这种情况，见下）。
+
+#### 探针命令（现役）
+
+```bash
+tools/probe.sh ch last    # 捕获总览 + 全部去重签名
+tools/probe.sh ch files   # 被 hold 住的 CloudFile（重放的输入）
+tools/probe.sh ch hier    # 每个捕获对象的类型图 —— 读 R8 混淆类的唯一手段
+tools/probe.sh ch go28    # 重放下载第 28 个（无空格，见 11.6）
+```
+
+UI 侧用 `tools/ui.py`（`dump` / `find <regex>` / `tap <regex>` / `long <regex>` / `tapxy` / `back`），
+它每次 `uiautomator dump` 现取坐标再点 —— 本项目早期凭记忆点 `84,72` 点错过一次。
+
+`tools/probe.sh` 取代了早期的 `probe.sh`：后者从行号标记 tail，曾整段丢过回复；
+且它的 `sed` 只保留带 `BDCrypto:` 前缀的行 → **多行报告的正文本就是没有前缀的那部分**，
+于是正文全被吃掉。`tools/probe.sh` 每次都重读整个日志并按行剥前缀。
+
+#### 仍然存在的限制
+
+- 重放**依赖先观察过一次真实下载**。目前 `api` 实例只在下过一次东西之后才被持有；
+  下一步可以做的是反射 `new FDDownloadManagerApi()` + `api.q(list, flag, null, null)`
+  自行造工厂，从而彻底摆脱"第一次必须由人手点"。
+- `ch go` 一次只下一个文件，且**必须等它落盘**才能读。P2 要读的元数据文件（`dir.c9r` 等）
+  都很小，代价可接受；但这条通道不适合流式解密，P3 应走 §11.5 的就地解密路径。
+
+### 11.8 顺带发现：自带的类索引有个会骗人的盲点
+
+`module/assets/app_classes.txt.gz` 由 `module/tools/gen_class_index.py` 从**出厂 dex** 生成，
+原先硬编码只收 `com/baidu/netdisk/` 前缀 —— 于是 **R8 搬走的混淆类一个都不在里面**。
+`classes no0` 查不到东西，而 `no0.___` 恰恰就是那个下载工厂。
+
+出厂 dex 里实际有 **174,938** 个类描述符，旧过滤器只留下 **53,482** 个。现已改为默认收录全部
+（`prefix` 可选，空 = 全收），产物 839 KB gzip，模块 APK 从 2.4 MB 涨到 2.9 MB，可以接受。
+
+> 教训与 11.7 是同一条：**在 R8 构建里，名字不是证据**。索引按名字前缀过滤，
+> 就等于系统性地过滤掉最需要查的那些类。
+
+### 11.9 下一阶段（P2）开工状态
+
+P0-D 的测试保险库已完成（见 §12），P2 的对照物齐了。剩下的是纯离线工作：
+解锁（scrypt → AES-KW → `vault.cryptomator` 验签 → `cipherCombo`）+ 目录遍历
+（`dirId` 是 UUID、`dir.c9r` 明文、`dirid.c9r` 走加密通道）+ 文件名解密。
+读密文用 §11.7 的通道，读出后用 `tools/oracle` 的清单比对。
 
 ---
 
