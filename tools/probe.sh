@@ -60,6 +60,19 @@ if [ -n "$extra" ]; then
 fi
 "$ADB" "${args[@]}" >/dev/null 2>&1
 
-sleep "${PROBE_WAIT:-3}"
-pull
+# Poll instead of sleeping once. LSPosed flushes the module log asynchronously, so a fixed wait
+# races the writer: measured 2026-10-08, the same command answered in 2 ms while a 3 s sleep still
+# saw an unchanged file, and the empty output read exactly like "the module did not answer".
+deadline=$((SECONDS + ${PROBE_DEADLINE:-12}))
+while :; do
+    sleep 1
+    pull
+    if [ "$(wc -l < "$CACHE")" -gt "$before" ]; then
+        break
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "p.sh: no answer in ${PROBE_DEADLINE:-12}s (log still at $before lines)" >&2
+        break
+    fi
+done
 tail -n +$((before + 1)) "$CACHE"

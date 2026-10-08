@@ -84,6 +84,18 @@ public final class Channel {
     private static volatile String factoryTrigger = "-";
     private static volatile String receiverTrigger = "-";
 
+    /** The app's class loader, kept so a receiver can be built after {@link #install}. */
+    private static volatile ClassLoader appLoader;
+
+    /**
+     * Keeps the reference handed to a manufactured receiver alive.
+     *
+     * <p>{@code TaskResultReceiver} extends {@code WeakRefResultReceiver}, which holds its
+     * reference <em>weakly</em>. A reference nobody else holds is collected and every later result
+     * is dropped without a word, so the object has to be owned from here.
+     */
+    private static volatile Object receiverReference;
+
     /** The last {@code N} CloudFiles the list handed us, so a replay has something to download. */
     private static final int MAX_FILES = 200;
     private static final List<Object> files = Collections.synchronizedList(new ArrayList<Object>());
@@ -111,6 +123,7 @@ public final class Channel {
     };
 
     public static void install(ClassLoader cl) {
+        appLoader = cl;
         for (String name : CLASSES) {
             Class<?> c = XposedHelpers.findClassIfExists(name, cl);
             if (c == null) {
@@ -383,9 +396,11 @@ public final class Channel {
             body = "ch: unknown argument '" + a + "' (last | files | hier | go <n|name> [flag])";
         }
         // The LSPosed log truncates a single record at ~7.6 KB, which silently ate the tail of the
-        // 37-signature list. A file has no such limit.
+        // 37-signature list. A file has no such limit. Note the per-process name: the broadcast
+        // reaches both the main process and :p2p, and a shared file would show only whichever
+        // answered last — which is how a held CloudFile once looked missing.
         if (ctx != null && body != null && body.length() > 400) {
-            String path = Report.write(ctx, "ch.txt", body);
+            String path = Report.write(ctx, Report.perProcess(ctx, "ch.txt"), body);
             Logx.i(head(body) + "\n… (" + body.length() + " chars, full text in " + path + ")");
         } else {
             Logx.i(body);
@@ -717,6 +732,281 @@ public final class Channel {
         }
     }
 
+    /**
+     * The receiver a replay hands to the pipeline: a borrowed one, or one built here.
+     *
+     * <p><b>A null receiver does not degrade the download, it fails it</b>, and the failure says
+     * "factory". Measured on the device ({@code 2026-10-08 15:53}, replaying a held file):
+     *
+     * <pre>
+     *   DownloadTaskManager.d(ArrayList, no0.___, null, 0)
+     *   DownloadTaskManager.G(ArrayList, "java.lang.NullPointerException: Attempt to invoke
+     *       interface method 'boolean com.baidu.netdisk.transfer.ba…")
+     * </pre>
+     *
+     * <p>The truncated tail is {@code …base.Processor$OnAddTaskListener.onAddTask()}, and it is the
+     * manager that builds that listener out of the receiver. So the empty slot is the cause, not the
+     * borrowed factory — which is what the message points at, and what an earlier round of this
+     * investigation chased.
+     *
+     * <p>No real download has to happen first. The app's own receiver is
+     * {@code FDDownloadManagerApi$addDownloadListTaskReality$newReceiver$1}, and its superclass
+     * {@code TaskResultReceiver} is a concrete class with a public {@code (Object, Handler)}
+     * constructor. The reference it wants is a {@code ResultReceiver} — which is exactly what the
+     * app passes it — so a plain {@code android.os.ResultReceiver} does, and results that come back
+     * through it are simply ignored.
+     */
+    private static Object receiver() {
+        Object borrowed = lastReceiver;
+        if (borrowed != null) {
+            return borrowed;
+        }
+        if (receiverReference == null) {
+            lastReceiver = buildReceiver();
+            if (lastReceiver == null) {
+                Logx.w("[ch#receiver] no receiver could be built — a replay without one fails in "
+                        + "onAddTask(); the app's own download would supply one");
+                return null;
+            }
+        }
+        return lastReceiver;
+    }
+
+    /**
+     * Instantiates one of the app's concrete {@code TaskResultReceiver}s.
+     *
+     * <p>{@code TaskResultReceiver} itself is <b>abstract</b> — its {@code onSuccess} and
+     * {@code onFailed} are the hooks a subclass fills in — so it cannot be instantiated directly.
+     * That cost a build: {@code InstantiationException: Can't instantiate abstract class …}, after
+     * a previous attempt had failed differently at the same line.
+     *
+     * <p>The concrete one the app uses is an anonymous class declared inside
+     * {@code FDDownloadManagerApi} (its runtime name is
+     * {@code FDDownloadManagerApi$addDownloadListTaskReality$newReceiver$1}), constructed as
+     * {@code (ResultReceiver, Context, Handler)}. That name is an R8 artefact and is only the last
+     * resort here; the search is over the type graph, so an app update that renames the enclosing
+     * method changes nothing.
+     *
+     * <p>Arguments are matched by parameter <em>type</em> rather than by position, because the only
+     * thing that is genuinely knowable about an anonymous class is its type graph — the same reason
+     * this whole class recognises actors by type and not by name.
+     */
+    private static Object buildReceiver() {
+        Class<?> base;
+        try {
+            base = XposedHelpers.findClass(
+                    "com.baidu.netdisk.transfer.task.TaskResultReceiver", appLoader);
+        } catch (Throwable t) {
+            return null;
+        }
+        Object ref = new android.os.ResultReceiver(mainHandler());
+        for (Class<?> c : receiverCandidates(base)) {
+            for (java.lang.reflect.Constructor<?> ctor : c.getDeclaredConstructors()) {
+                Object[] args = argsFor(ctor.getParameterTypes(), ref);
+                if (args == null) {
+                    continue;
+                }
+                try {
+                    ctor.setAccessible(true);
+                    Object made = ctor.newInstance(args);
+                    receiverReference = ref;   // own it: the receiver holds the reference weakly
+                    receiverTrigger = "built here as " + c.getName()
+                            + " (no real download in this process yet)";
+                    Logx.i("[ch#receiver] built a " + c.getName() + ctorShape(ctor)
+                            + " — the app has not downloaded anything in this process yet");
+                    return made;
+                } catch (Throwable t) {
+                    Logx.w("[ch#receiver] " + c.getName() + ctorShape(ctor) + " threw " + t);
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Every concrete {@code TaskResultReceiver} the pipeline classes declare, and the known name. */
+    private static List<Class<?>> receiverCandidates(Class<?> base) {
+        List<Class<?>> out = new ArrayList<Class<?>>();
+        List<Class<?>> owners = new ArrayList<Class<?>>();
+        owners.add(base);
+        for (String name : CLASSES) {
+            Class<?> c = XposedHelpers.findClassIfExists(name, appLoader);
+            if (c != null) {
+                owners.add(c);
+            }
+        }
+        for (Class<?> owner : owners) {
+            Class<?>[] inner;
+            try {
+                inner = owner.getDeclaredClasses();
+            } catch (Throwable t) {
+                continue;
+            }
+            for (Class<?> c : inner) {
+                if (c == base || Modifier.isAbstract(c.getModifiers())
+                        || Modifier.isInterface(c.getModifiers()) || !isA(c, T_RECEIVER)) {
+                    continue;
+                }
+                if (!out.contains(c)) {
+                    out.add(c);
+                }
+            }
+        }
+        // The name it had on 2026-10-08; kept only as a backstop for the day getDeclaredClasses
+        // stops listing anonymous classes.
+        Class<?> known = XposedHelpers.findClassIfExists(
+                "com.baidu.netdisk.file.download.component.apis.FDDownloadManagerApi"
+                        + "$addDownloadListTaskReality$newReceiver$1", appLoader);
+        if (known != null && !out.contains(known) && !Modifier.isAbstract(known.getModifiers())) {
+            out.add(known);
+        }
+        return out;
+    }
+
+    /**
+     * Arguments for a constructor, matched by parameter type.
+     *
+     * @return null when a parameter cannot be satisfied — the caller then simply tries another
+     *     constructor, which is the point: nothing here has to know the order.
+     */
+    private static Object[] argsFor(Class<?>[] ps, Object ref) {
+        Object[] args = new Object[ps.length];
+        for (int i = 0; i < ps.length; i++) {
+            Class<?> p = ps[i];
+            if (android.os.ResultReceiver.class.isAssignableFrom(p) || p == Object.class) {
+                args[i] = ref;
+            } else if (android.content.Context.class.isAssignableFrom(p)) {
+                args[i] = Hooks.app();
+            } else if (Handler.class.isAssignableFrom(p)) {
+                args[i] = mainHandler();
+            } else if (p == boolean.class) {
+                args[i] = Boolean.FALSE;
+            } else if (p == int.class) {
+                args[i] = Integer.valueOf(0);
+            } else if (p == long.class) {
+                args[i] = Long.valueOf(0L);
+            } else if (!p.isPrimitive()) {
+                args[i] = null;   // an object we have nothing for: null is often acceptable
+            } else {
+                return null;
+            }
+        }
+        return args;
+    }
+
+    private static String ctorShape(java.lang.reflect.Constructor<?> ctor) {
+        StringBuilder sb = new StringBuilder("(");
+        Class<?>[] ps = ctor.getParameterTypes();
+        for (int i = 0; i < ps.length; i++) {
+            sb.append(i > 0 ? ", " : "").append(ps[i].getSimpleName());
+        }
+        return sb.append(')').toString();
+    }
+
+    // --------------------------------------------------- the processor factory ---
+
+    /**
+     * Asks the app's own API for a processor factory, supplying the two callbacks it insists on.
+     *
+     * <p>Recognised by <em>shape</em>, not by name: a method of {@code FDDownloadManagerApi} that
+     * returns an {@code IDownloadProcessorFactory} and takes {@code (List, int, <interface>,
+     * <interface>)}. The name is {@code q} in the shipping build and saying so would be a claim
+     * about R8's output rather than about the app.
+     */
+    private static Object buildFactory(List<Object> list, int flag, StringBuilder sb) {
+        if (api == null) {
+            sb.append("  factory: no FDDownloadManagerApi instance captured yet\n");
+            return null;
+        }
+        Method maker = factoryMethod(api.getClass());
+        if (maker == null) {
+            sb.append("  factory: nothing on ").append(Reflectx.simple(api.getClass().getName()))
+                    .append(" returns an IDownloadProcessorFactory from (List, int, ?, ?)\n");
+            return null;
+        }
+        Class<?>[] ps = maker.getParameterTypes();
+        Object onProcess = stub(ps[2]);
+        Object onAddTask = stub(ps[3]);
+        try {
+            maker.setAccessible(true);
+            Object made = maker.invoke(api, list, flag, onProcess, onAddTask);
+            sb.append("  factory: ").append(Reflectx.simple(api.getClass().getName())).append('.')
+                    .append(maker.getName()).append("(list, ").append(flag)
+                    .append(", ").append(ps[2].getSimpleName()).append("@stub")
+                    .append(", ").append(ps[3].getSimpleName()).append("@stub) -> ")
+                    .append(typeName(made)).append('\n');
+            return made;
+        } catch (Throwable t) {
+            Throwable c = t.getCause() == null ? t : t.getCause();
+            sb.append("  factory: ").append(maker.getName()).append(" threw ").append(c).append('\n');
+            return null;
+        }
+    }
+
+    /** The factory maker, by return type and parameter shape. */
+    private static Method factoryMethod(Class<?> apiClass) {
+        for (Class<?> k = apiClass; k != null && k != Object.class; k = k.getSuperclass()) {
+            for (Method m : safeMethods(k)) {
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length == 4 && ps[0] == List.class && ps[1] == int.class
+                        && ps[2].isInterface() && ps[3].isInterface()
+                        && m.getReturnType().getName().endsWith("IDownloadProcessorFactory")) {
+                    return m;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A do-nothing implementation of one of the app's callback interfaces.
+     *
+     * <p>These exist because the app's processor machinery has to be able to call back into
+     * something, and nothing in the module wants to be called. A proxy answers, keeps the pipeline
+     * happy, and — unlike passing null — leaves the field it was assigned to non-null, which is the
+     * difference between a download that runs and one that dies in {@code onAddTask()}.
+     *
+     * <p>{@code boolean} returns true: the one boolean the pipeline asks is whether to add the task,
+     * and the answer this caller wants is yes.
+     */
+    private static Object stub(Class<?> iface) {
+        ClassLoader loader = iface.getClassLoader() == null ? appLoader : iface.getClassLoader();
+        return java.lang.reflect.Proxy.newProxyInstance(loader, new Class<?>[]{iface},
+                new java.lang.reflect.InvocationHandler() {
+                    @Override
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        // Object's own methods land here too, and returning null from toString would
+                        // turn a stray debug log inside the app into a crash.
+                        if (method.getDeclaringClass() == Object.class) {
+                            String n = method.getName();
+                            if ("toString".equals(n)) {
+                                return "bdcrypto-stub(" + iface.getSimpleName() + ")";
+                            }
+                            if ("hashCode".equals(n)) {
+                                return Integer.valueOf(System.identityHashCode(proxy));
+                            }
+                            if ("equals".equals(n)) {
+                                return Boolean.valueOf(proxy == (args == null ? null : args[0]));
+                            }
+                        }
+                        Class<?> r = method.getReturnType();
+                        if (r == void.class) {
+                            return null;
+                        }
+                        if (r == boolean.class) {
+                            return Boolean.TRUE;
+                        }
+                        if (r == int.class) {
+                            return Integer.valueOf(0);
+                        }
+                        if (r == long.class) {
+                            return Long.valueOf(0L);
+                        }
+                        return null;
+                    }
+                });
+    }
+
+
     /** Hands one held CloudFile to the app's own download pipeline and describes what happened. */
     private static void downloadHeld(Object target, int flag, StringBuilder sb) {
         String fileName = Reflectx.callStr(target, "getFileName");
@@ -726,46 +1016,75 @@ public final class Channel {
                 .append("  size=").append(Reflectx.callLong(target, "getSize", -1L))
                 .append("  path=").append(Reflectx.callStr(target, "getFilePath")).append('\n');
 
-        // --- factory: prefer one the app already made; otherwise ask the app's own API to make one.
-        Object factory = lastFactory;
-        sb.append("  factory: ").append(typeName(factory))
-                .append(factory == null ? "" : " (borrowed from " + factoryTrigger + ")").append('\n');
-        if (factory == null && api != null) {
-            Att a = invoke(api, new String[]{"q"}, new Object[]{list, flag, null, null});
-            sb.append("  api.q(list, ").append(flag).append(", null, null) -> ").append(a).append('\n');
-            if (a.ret != null) {
-                factory = a.ret;
-            }
+        // --- factory: build a fresh one with our own listener stubs.
+        //
+        // The factory carries the two callbacks a Processor will need, and they are arguments of
+        // the factory maker, not properties of the download:
+        //
+        //     FDDownloadManagerApi.q(List, int, OnProcessListener, Processor$OnAddTaskListener)
+        //
+        // So `q(list, flag, null, null)` produces a factory that builds Processors whose `__` field
+        // is null, and the transfer dies later with
+        // "NullPointerException: Attempt to invoke interface method 'boolean
+        // com.baidu.netdisk.transfer.base.Processor$OnAddTaskListener.onAddTask()' on a null object
+        // reference" — an error that names the listener and not the call that left it empty. Both
+        // are interfaces, so they are proxied here rather than borrowed.
+        Object factory = buildFactory(list, flag, sb);
+        if (factory == null) {
+            factory = lastFactory;
+            sb.append("  factory: no maker found, falling back to the borrowed ")
+                    .append(typeName(factory)).append(' ')
+                    .append(factory == null ? "" : "(from " + factoryTrigger + ")").append('\n');
         }
-        Object receiver = lastReceiver;
+        Object receiver = receiver();
         sb.append("  receiver: ").append(typeName(receiver))
-                .append(receiver == null ? "" : " (borrowed from " + receiverTrigger + ")"); 
+                .append(receiver == null ? "" : " (from " + receiverTrigger + ")"); 
         sb.append('\n');
 
         // --- then replay, trying each entry point the app itself was observed to use.
-        if (manager != null) {
-            sb.append("  --- via DownloadTaskManager (this is what the app itself called) ---\n");
-            if (attempt(sb, manager, "d", new Object[]{list, factory, receiver, flag})
-                    || attempt(sb, manager, "e", new Object[]{list, factory, receiver, flag, null})
-                    || attempt(sb, manager, "f", new Object[]{target, factory, receiver, flag})) {
-                sb.append("  result: an entry point accepted the task\n");
+        //
+        // The façade comes first. A captured DownloadTaskManager is a stale object: the app builds
+        // a *new* one per download (its constructor takes a session token — observed on
+        // 2026-10-07 as DownloadTaskManager(String, String)), and a reused one accepts the task,
+        // answers sendSuccess(), and then transfers nothing at all. That is a worse failure than an
+        // exception, because the log says the download was added.
+        if (api != null && activity() != null) {
+            sb.append("  --- via FDDownloadManagerApi.g (the app's own façade, builds its own "
+                    + "manager) ---\n");
+            if (attempt(sb, api, "g",
+                    new Object[]{activity(), Boolean.TRUE, list, factory, receiver, flag})
+                    || attempt(sb, api, "______",
+                    new Object[]{activity(), Boolean.TRUE, list, factory, receiver, flag, null})) {
+                sb.append("  result: the facade accepted the task\n");
                 return;
             }
         }
-        if (api != null && lastActivity != null) {
-            sb.append("  --- via FDDownloadManagerApi ---\n");
-            if (attempt(sb, api, "g",
-                    new Object[]{lastActivity, Boolean.TRUE, list, factory, null, flag})
-                    || attempt(sb, api, "______",
-                    new Object[]{lastActivity, Boolean.TRUE, list, factory, null, flag, null})
-                    || attempt(sb, api, "c",
-                    new Object[]{lastActivity, list, flag, 0, Boolean.TRUE, null, null, null, null,
+        if (manager != null) {
+            sb.append("  --- via the captured DownloadTaskManager (may be a stale instance) ---\n");
+            if (attempt(sb, manager, "d", new Object[]{list, factory, receiver, flag})
+                    || attempt(sb, manager, "e", new Object[]{list, factory, receiver, flag, null})
+                    || attempt(sb, manager, "f", new Object[]{target, factory, receiver, flag})) {
+                sb.append("  result: a captured manager accepted the task (not necessarily a "
+                        + "transfer)\n");
+                return;
+            }
+        }
+        if (api != null && activity() != null) {
+            sb.append("  --- via FDDownloadManagerApi, other shapes ---\n");
+            if (attempt(sb, api, "c",
+                    new Object[]{activity(), list, flag, 0, Boolean.TRUE, null, null, null, null,
                             null})) {
                 sb.append("  result: an entry point accepted the task\n");
                 return;
             }
         }
         sb.append("  result: every entry point refused (see the lines above)\n");
+    }
+
+    /** The Activity a replay needs: one seen in the pipeline, else the file page's own. */
+    private static Object activity() {
+        Object a = lastActivity;
+        return a != null ? a : Hooks.activity();
     }
 
     /** Tries one method name; returns true only if a matching overload ran without throwing. */

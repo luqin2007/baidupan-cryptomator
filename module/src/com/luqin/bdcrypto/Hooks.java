@@ -1775,6 +1775,18 @@ public final class Hooks {
         return a instanceof android.app.Activity ? (android.app.Activity) a : null;
     }
 
+    /**
+     * The Activity the file page is living in, or null.
+     *
+     * <p>For {@link Channel}: the app's download façade takes an {@code Activity} because it is
+     * entitled to raise a dialog or a notification, so a replay needs one too. {@code Channel} only
+     * ever sees an Activity when one happens to pass through the download pipeline, which is not the
+     * case before the app has downloaded anything in this process.
+     */
+    static android.app.Activity activity() {
+        return activityOf(lastFragment());
+    }
+
     private static android.view.View fragmentViewOf(Object fragment) {
         Object v = fragment == null ? null : Reflectx.call0(fragment, "getView");
         return v instanceof android.view.View ? (android.view.View) v : null;

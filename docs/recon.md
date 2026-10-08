@@ -1306,3 +1306,114 @@ wrap_content 的子视图**不论可见性**都按 `getSuggestedMinimumHeight()`
 - **面包屑仍是密文名**（`d / SY / RGEQKQVHFPTPFOF65L6I62FLLYWDS7`）。
 - **`.c9s` 超长名仍未解**（§14.4 第三条）。
 - **按钮只在保险库页那一页**：进了密文树就看不到「还原」，要锁定得先退回保险库目录。
+
+---
+
+## 15. P3：内容通道终于打通，以及"点进子目录还是密文"的根因（2026-10-08 傍晚）
+
+现象（用户报告）：解锁后点进 `游戏`，那一页仍只有 `dir.c9r`，看起来是空的；
+同一保险库用 OpenList 挂载后解密能正常看到结构，说明数据没问题。
+
+### 15.1 为什么"点进去是空的"——两层原因，第一层已修
+
+**格式层（不是 bug，是布局）**：`游戏` 在根内容目录里只是
+`LZPMYUHidTFupQNjAHMN6Fqr-1SA5Q==.c9r/`，里面只有 `dir.c9r`（36 B）。
+它的内容在另一个分支 `d/<hashDirectoryId(dirId)>` 下，而 `hashDirectoryId` 是**单向**的
+（§13.4）—— 所以模块必须先**读出 `dir.c9r`**，才知道该去哪儿找内容。
+
+**通道层（真 bug，本轮修掉）**：`dir.c9r` 从未被下载下来，`Channel.fetch` 一直失败。
+拆开是两个独立缺陷，**两个都在 app 自己的 API 签名里**：
+
+1. **`receiver` 传了 `null`。** `DownloadTaskManager.d(list, factory, receiver, flag)` 的第 3 参
+   不能为空 —— 管理器要用它构造 `Processor.__`（`Processor$OnAddTaskListener`）。传空的后果是
+   延迟爆炸、且错误信息指错方向：
+
+   ```
+   DownloadTaskManager.G(List, "java.lang.NullPointerException: Attempt to invoke interface
+     method 'boolean com.baidu.netdisk.transfer.base.Processor$OnAddTaskListener.onAddTask()'
+     on a null object reference")
+   ```
+
+   这条信息里出现的是 `OnAddTaskListener`，而它是在 `d(...)` 那一步被留空的。
+
+2. **factory 的构造参数传了 `null`。** 真身签名是
+
+   ```
+   FDDownloadManagerApi.q(List, int, OnProcessListener, Processor$OnAddTaskListener)
+   ```
+
+   第 3/4 参**就是** `Processor._` 与 `Processor.__` 的来源。`q(list, flag, null, null)` 造出来的
+   factory 会生产 `__` 为空的 `Processor` —— 与第 1 条是同一个 NPE，但换了一条路径。
+
+**修法（`Channel`）**：两个回调都是**接口**，用 `java.lang.reflect.Proxy` 造空实现
+（`boolean` 一律返回 `true`：管线唯一会问的布尔量是 `onAddTask()`，这里要的答案是"加"）。
+`receiver` 不能传空，`TaskResultReceiver` 是**抽象类**（`onSuccess`/`onFailed` 是钩子），
+所以去找它**具体的子类**：`FDDownloadManagerApi` 的匿名内部类
+`…$addDownloadListTaskReality$newReceiver$1(ResultReceiver, Context, Handler)`，
+按**类型图**搜索（`getDeclaredClasses()` + `isA`），不按名字。
+
+### 15.2 还有一条：别用捕获到的 `DownloadTaskManager`
+
+App **每次下载都新建一个** `DownloadTaskManager`（构造签名 `(String, String)`，2026-10-07 实测），
+所以捕获到的那个是**过期实例**：它接受任务、回 `sendSuccess()`、然后什么都不传。
+比抛异常更糟 —— 日志会说"任务已加入"。因此重放**先走 App 自己的门面**
+`FDDownloadManagerApi.g(Activity, boolean, List, factory, ResultReceiver, int)`，
+它会自己造新的 manager。
+
+### 15.3 实测证据（`0.11.13-p3f`）
+
+```
+[ch#receiver] built a …$addDownloadListTaskReality$newReceiver$1(ResultReceiver, Context, Handler)
+[ch#factory]  FDDownloadManagerApi.q(List(1)[…dir.c9r…], 0, $Proxy47@stub, $Proxy48@stub) -> no0.___
+[dl] …DownloadTaskManager.d(ArrayList, no0.___, …$newReceiver$1, 0)
+get: /storage/emulated/0/Download/BaiduNetdisk/crypto/content/d/SY/RGEQ…/LZPM…==.c9r/dir.c9r  36 B
+```
+
+落盘内容（`od -c`）：
+
+```
+0000000   1   4   e   7   4   b   6   d   -   4   e   0   a   -   4   3
+0000020   5   e   -   9   3   6   a   -   4   0   b   4   3   6   e   5
+0000040   d   a   1   1
+```
+
+即 `14e74b6d-4e0a-435e-936a-40b436e5da11` —— 纯文本 UUID，与 §12.3 的说法一致
+（`dir.c9r` 是**明文** id，不是密文）。
+
+### 15.4 连接点已验证（这是 P3 的钥匙）
+
+用官方 cryptolib 的 oracle 把上一步读到的 id 换算成位置：
+
+```
+oracle.sh hash <vault> <pass> - 14e74b6d-4e0a-435e-936a-40b436e5da11
+  <root>                                  -> SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7   ✓ 与解锁日志一致
+  14e74b6d-4e0a-435e-936a-40b436e5da11    -> DI/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I   ✓ 就是那 90+ 个游戏文件的目录
+```
+
+**于是链条闭合**：`游戏` 行 → `dir.c9r` = `14e74b6d-…` → `d/DI/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I`
+→ 那里面的 `<b64url>.c9r` 就是游戏文件，用该 id 解密行名即可显示。
+
+### 15.5 还没做：把用户**送**到 `d/DI/…` 去
+
+通道通了，但还差一步：App 现在把用户送进 `…/LZPM…==.c9r`（物理上只有一个 `dir.c9r` 的指针目录），
+而不是 `d/DI/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I`（真正装内容的地方）。
+需要在那次导航上做**重定向**，三种插入点各有代价，需要先定行为：
+
+| 方案 | 插入点 | 代价 |
+|---|---|---|
+| A. 劫持行点击，先解析再导航 | `NetDiskFileListFragment.addNewChildFragment(Object, boolean)` 或行 `itemcard` 监听器 | 点一下要等一次（小文件）下载；中止原导航再补一次 |
+| B. 进页后自动前进 | 面包屑 → 发现是 `.c9r` 目录页 → 解析 → 自己发起导航 | 用户会看到页面闪一下；回退栈里多一层 |
+| C. 不重定向，只把名字改对 | 无（现状 + 面包屑重写） | 目录仍是空的，只是不再显示 `dir.c9r` |
+
+三者都需要另外解决**面包屑**：重定向后 App 会画 `d / DI / 7HKQ…`，得再写成 `游戏`。
+
+### 15.6 本轮顺带修掉的两个观测缺陷（都会造成"模块没反应"的误判）
+
+1. **两个进程写同一个报告文件。** 广播送达**每个**装了这个模块的进程（`main` 与 `:p2p`），
+   而 `ch.txt` 是同一个路径 —— 后写的把先写的**整个覆盖**掉，读者看不出区别。
+   这正是"主进程明明持有 `dir.c9r`，`ch files` 却说没有"的原因。
+   现在报告名按进程分开（`ch-main.txt` / `ch-p2p.txt`，`Report.perProcess`）。
+2. **`probe.sh` 的固定 sleep 会赛过 LSPosed 的异步刷盘。** 同一条命令实测 2 ms 就答了，
+   而 `sleep 3` 之后文件仍是旧长度 —— 输出为空，看起来和"模块没回答"一模一样。
+   现在改成轮询到日志增长或超时（`PROBE_DEADLINE`，默认 12 s）。
+
