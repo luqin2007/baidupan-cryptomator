@@ -1393,19 +1393,23 @@ oracle.sh hash <vault> <pass> - 14e74b6d-4e0a-435e-936a-40b436e5da11
 **于是链条闭合**：`游戏` 行 → `dir.c9r` = `14e74b6d-…` → `d/DI/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I`
 → 那里面的 `<b64url>.c9r` 就是游戏文件，用该 id 解密行名即可显示。
 
-### 15.5 还没做：把用户**送**到 `d/DI/…` 去
+### 15.5 把用户**送**到 `d/DI/…` 去：选 B，已落地（见 15.7）
 
 通道通了，但还差一步：App 现在把用户送进 `…/LZPM…==.c9r`（物理上只有一个 `dir.c9r` 的指针目录），
 而不是 `d/DI/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I`（真正装内容的地方）。
-需要在那次导航上做**重定向**，三种插入点各有代价，需要先定行为：
+需要在导航上做**重定向**，三种插入点各有代价：
 
 | 方案 | 插入点 | 代价 |
 |---|---|---|
 | A. 劫持行点击，先解析再导航 | `NetDiskFileListFragment.addNewChildFragment(Object, boolean)` 或行 `itemcard` 监听器 | 点一下要等一次（小文件）下载；中止原导航再补一次 |
-| B. 进页后自动前进 | 面包屑 → 发现是 `.c9r` 目录页 → 解析 → 自己发起导航 | 用户会看到页面闪一下；回退栈里多一层 |
+| **B. 进页后自动前进（已选）** | 面包屑 → 发现是 `.c9r` 目录页 → 解析 → 自己发起导航 | 用户会看到页面闪一下；回退栈里多一层 |
 | C. 不重定向，只把名字改对 | 无（现状 + 面包屑重写） | 目录仍是空的，只是不再显示 `dir.c9r` |
 
-三者都需要另外解决**面包屑**：重定向后 App 会画 `d / DI / 7HKQ…`，得再写成 `游戏`。
+选 B，因为它不需要打断 App 的点击流程（A 要在用户手势里等网络），也真正解决问题（C 不解决）。
+保险库根同样处理：用户选了「打开保险库就直接落到解密根」，代价是「还原」按钮要从保险库页
+跟到保险库内部的页上（见 15.7）。
+
+面包屑（重定向后 App 会画 `d / DI / 7HKQ…`）**仍未解决**，见 15.11。
 
 ### 15.6 本轮顺带修掉的两个观测缺陷（都会造成"模块没反应"的误判）
 
@@ -1417,3 +1421,98 @@ oracle.sh hash <vault> <pass> - 14e74b6d-4e0a-435e-936a-40b436e5da11
    而 `sleep 3` 之后文件仍是旧长度 —— 输出为空，看起来和"模块没回答"一模一样。
    现在改成轮询到日志增长或超时（`PROBE_DEADLINE`，默认 12 s）。
 
+
+### 15.7 重定向已落地（`0.11.25-p3r`，真机全通）
+
+两处走同一条路：**先让 App 正常落地，再把它挪到正确的那页去**。
+
+1. **保险库根 → 解密根。** `Nav.redirectVaultRoot`：`Hooks.samePath(drawn, session.cloudDir)` 时
+   目标 = `session.cloudDir + "/" + session.contentPathOf("")`。根 dirId 是空串，
+   所以**不需要任何 fetch**，解锁完成的那一刻目标就是已知的。
+2. **`.c9r` 指针目录 → 它的内容。** `Nav.redirectEntry`：`drawn.endsWith(".c9r")` 时：
+   - 父目录 id 从 `session.dirIdOfDrawn(父 crumb)` 取 —— **只有这一刻那一页还是"被画的那页"**；
+   - 入口相对路径 = `session.contentPathOf(parentDirId) + "/" + entryCipher`；
+   - 工作线程 `Channel.fetch(入口 + "/dir.c9r")` → `vault.childDirectoryId(入口相对路径)`
+     （`dir.c9r` 里是**明文 UUID**）→ `vault.contentPath(childDirId)`；
+   - **注册先于移动**：`session.remember(relContent, childDirId)` + `alias(lastSegment, …)`
+     + `alias(realName, …)`，因为新页建好就会绑行，晚了就是一行行密文。
+
+导航本身用 `NetDiskFileListFragment.addNewChildFragment(Object, boolean)`（private，声明在父类）
++ **凭空造的 `CloudFile`**（`new CloudFile(String)` → `setFilePath` / `setFileName` / `setDir`
+→ public int 字段 `isDir`）。这是 P3 唯一没验证过的假设，已用探针 `nav <cloudPath>` 单独证明：
+`crumb before: /crypto/content` → `crumb after: /crypto/content/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I`，
+列表填满 90+ 行。
+
+活树里的类是**子类 `FileTabListFragment`（自己声明 0 个方法）**，父类才是 `NetDiskFileListFragment`
+→ 找 fragment 必须按 `isInstance` 走父类链，按精确类名永远找不到。
+
+`oncePerPath` 保证一个入口只跳一次：入口目录仍在回退栈里，否则 back 会被反复推回去、永远退不出来。
+
+「还原」按钮跟着用户进保险库内部页：`inOpenVault(crumb)` = `session.dirIdOfDrawn(crumb) != null`，
+此时按钮的标签和动作都用 `session.cloudDir` 而不是页面 crumb 去比 ——
+解密根的 crumb（`…/content/RGEQ…`）**不是**保险库路径的后缀，两种比法都不通，只有 session 认得出。
+
+### 15.8 真正的坑：读新页的那一趟 pass 会到得太早（同版本两次解锁，一成一败）
+
+同一个 APK 连着解锁两次：
+
+- **第一次**：`drawn=/crypto/content/RGEQ…`，行改写成功（`-> 游戏`、`-> 欢迎.rtf`、`dirid.c9r` 隐藏）。
+- **第二次**：面包屑已经变成 `…/content/RGEQ…`（**屏幕确实跳了**），但行全是密文，
+  日志是 `[list] bind … drawn=/crypto/content :: no dirId for this page`。
+
+根因一句话：**新页已经存在、面包屑也已经有字，但 `isShown()` 还是 false。**
+`reconcile` 从后往前挑「最后一个 shown 且 crumb 可读」的副本 → 跳过新页 → 落到它取代的那一页
+→ 读到**正在离开的那个目录**。而面包屑**每次目录变化只触发一次**，那次已经用掉了，
+**不会有第二趟** —— 于是：页面动了，名字没动。
+
+修法 `Nav.settleAfterRedirect(dirId)`：导航落地后每 200 ms 请求一次 `reconcile`，
+直到「被画的那页」解析成**目标目录 id** 为止（上限 10 次，没等到就留一行日志放弃）。
+
+> **必须比 dirId，不能比路径。** 同一个目录，面包屑和内容路径是**两个不同的字符串**：
+> 一次导航进来的页只显示一段 crumb，所以解密根画成 `…/content/RGEQ…`，
+> 而它的内容路径是 `…/d/SY/RGEQ…`。路径比较永远不会相等。
+> session 两种拼法都认识（`dirIdByContent` + `dirIdByAlias`），问它才对。
+
+### 15.9 让这件事可见的两条诊断
+
+这两条不是装饰，是**这次能定位的原因**：
+
+1. `[recon] pass queued by <触发源>`：每趟 pass 一行。被合并掉的触发**故意不记** ——
+   一次换目录会从它绑的每一段 crumb 触发，逐条记就是 12 行噪音埋掉它自己产生的 pass。
+2. 一趟 pass 若**一个副本都读不出来**，打印**全部**副本的 `i:crumb/shown|hidden`。
+   「新页还没 shown」和「新页 shown 了但 crumb 还空」**从外面看一模一样**，而修法相反。
+
+### 15.10 实测证据（`0.11.25-p3r`，单次解锁的干净会话）
+
+```
+unlock → 面包屑 [crypto, content, RGEQKQVHFPTPFOF65L6I62FLLYWDS7]
+         行：游戏 / 欢迎.rtf；dirid.c9r 隐藏（lp.height -2 -> 0）；按钮读「还原」
+tap 游戏 → 面包屑 [LZPMYUHidTFupQNjAHMN6Fqr-1SA5Q==.c9r, 7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I]
+         Yunyun Syndrome! Rhythm Psychosis (2026).7z     2.55GB
+         UNITIA 神託の使徒×終焉の女神 游戏+动画
+         死亡之种2：完全版.7z.006                         1.91GB
+         Dungeon Devotion v1.4.7z                        111.82MB
+         LUNA PC.zip                                     3.48GB
+```
+
+`dirId = 14e74b6d-4e0a-435e-936a-40b436e5da11`，与 `tools/oracle/` **离线**算出来的是同一个 id
+→ 这一页确实是格式规定的那个目录，不是撞对的。
+
+日志（两条 settle 各自确认落地）：
+
+```
+[nav] vault root opened: /crypto/content -> /crypto/content/d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7
+[nav] opened the decrypted root /crypto/content/d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7
+[nav] the drawn page is the redirect target (dirId "", crumb /crypto/content/RGEQKQVHFPTPFOF65L6I62FLLYWDS7)
+[nav] /RGEQKQVHFPTPFOF65L6I62FLLYWDS7/LZPMYUHidTFupQNjAHMN6Fqr-1SA5Q==.c9r -> /crypto/content/d/DI/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I (dirId 14e74b6d-…, "游戏")
+[nav] redirected to /crypto/content/d/DI/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I
+[nav] the drawn page is the redirect target (dirId "14e74b6d-…", crumb /LZPMYUHidTFupQNjAHMN6Fqr-1SA5Q==.c9r/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I)
+```
+
+### 15.11 仍未做（P2/P3 收尾）
+
+- **面包屑仍是密文名 / 哈希名**：根页写 `RGEQ…`，进子目录写 `LZPM…==.c9r / 7HKQ…`。
+  行名已改写，但 crumb 是 App 用**自己的模型**画的，不是从我们改过的 `TextView` 读的。
+- **尺寸列仍是密文大小**：`磁盘 = 68 + 28*ceil(明文/32768) + 明文`（求逆见 12.4/13.5）。
+- **`.c9s` 超长名**未解。
+- **「还原」的返回栈语义**：重定向是 push，back 回到入口指针页（`oncePerPath` 保证不会再被弹走）。
