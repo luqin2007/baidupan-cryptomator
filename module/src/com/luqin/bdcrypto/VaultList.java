@@ -74,8 +74,16 @@ public final class VaultList {
      */
     private static final int BIND_LOG_PER_PAGE = 3;
 
-    /** Hard cap, so a pathological rebind loop cannot flood the log. */
-    private static final int BIND_LOG_MAX = 40;
+    /**
+     * Hard cap, so a pathological rebind loop cannot flood the log.
+     *
+     * <p>Was 40, which is too small to be anything but a trap: reaching the vault directory means
+     * walking through the home page, {@code /crypto}, {@code /crypto/content}, {@code d} and
+     * {@code d/SY}, and the ciphertext names of a listing alone are three lines each — so the
+     * budget was spent before the page that matters, and the vault root logged <em>nothing</em>.
+     * That is how a measurement added specifically to be quoted went missing for a whole build.
+     */
+    private static final int BIND_LOG_MAX = 200;
 
     /** The directory the drawn page is showing, as a cloud path. Set by {@link Hooks#reconcile}. */
     private static volatile String drawnCloudPath;
@@ -222,6 +230,10 @@ public final class VaultList {
     private static void afterBind(XC_MethodHook.MethodHookParam param) {
         Object holder = param.args != null && param.args.length > 0 ? param.args[0] : null;
         View row = viewOf(holder);
+        // Before anything is decided about this bind: the view may be a recycled one that a previous
+        // pass collapsed, or a row of a page that has just been re-locked. Either way the app's own
+        // bind has already written its text, and the geometry has to be the app's again too.
+        uncollapseRow(row);
         VaultUi.Session session = VaultUi.session();
         if (session == null) {
             logBind(textOf(row), "no vault unlocked in this process");
@@ -290,12 +302,10 @@ public final class VaultList {
             return "left (not a vault entry)";
         }
         if (Vault.isInternal(text)) {
-            // A content row the user must not see. Safe to hide because every visible row is
-            // rebound, and the next rebind of this view puts it back (below).
-            row.setVisibility(View.GONE);
-            return "hidden (format's own file)";
+            // A content row the user must not see. The next bind of this view puts it back
+            // (uncollapseRow, at the top of afterBind).
+            return collapseRow(row);
         }
-        row.setVisibility(View.VISIBLE);
         if (text.endsWith(".c9s")) {
             // A shortened name: its cleartext name lives inside the folder, which cannot be read
             // until that folder is listed. Left as drawn rather than guessed at.
@@ -312,6 +322,70 @@ public final class VaultList {
             Logx.w("[list] " + text + " does not decrypt under " + dirId + ": " + t);
             return "left (decrypt failed: " + t + ")";
         }
+    }
+
+    /**
+     * What was there before this module collapsed a row — {@code {lp.height, minHeight}} — keyed by
+     * view.
+     *
+     * <p>Weak keys because rows are the app's views and outlive any particular bind: when a row is
+     * recycled its entry falls out on its own, and nothing here keeps it alive.
+     */
+    private static final java.util.Map<View, int[]> COLLAPSED =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<View, int[]>());
+
+    /** Give a collapsed row the app's own geometry back. A no-op on a row this module never hid. */
+    private static void uncollapseRow(View row) {
+        if (row == null) {
+            return;
+        }
+        int[] was = COLLAPSED.remove(row);
+        if (was == null) {
+            return;
+        }
+        ViewGroup.LayoutParams lp = row.getLayoutParams();
+        if (lp != null) {
+            lp.height = was[0];
+        }
+        row.setMinimumHeight(was[1]);
+        row.setVisibility(View.VISIBLE);
+        row.requestLayout();
+    }
+
+    /**
+     * Hides a row the format needs and the user must not see.
+     *
+     * <p>{@code View.GONE} on its own does NOT do this, which is why this is a method rather than one
+     * line in {@link #rewrite}. Measured on the device, the row's {@code lp.height} is {@code -2}
+     * (WRAP_CONTENT) and its {@code getMinimumHeight()} is {@code 187} px — so the instinct "GONE
+     * plus wrap_content must collapse" is wrong, because a wrap_content child is still measured at
+     * {@code getSuggestedMinimumHeight()} whatever its visibility is. The result was a full-height
+     * 187 px hole between two file rows. An explicit layout height of 0 is what reclaims it.
+     *
+     * <p>The measurement is in the returned line rather than only in this comment, because this is
+     * exactly the kind of claim that is easy to write down wrongly: the first version of this method
+     * asserted a fixed pixel height in LayoutParams, and the log answered {@code lp.height -2}.
+     */
+    private static String collapseRow(View row) {
+        ViewGroup.LayoutParams lp = row.getLayoutParams();
+        int before = lp == null ? -1 : lp.height;
+        int minHeight = row.getMinimumHeight();
+        int wasMeasured = row.getMeasuredHeight();
+        if (lp != null) {
+            // Only record the first time: the value in there now may already be this method's own 0,
+            // and recording that would make the restore a no-op that leaves the row permanently flat.
+            if (lp.height != 0 && !COLLAPSED.containsKey(row)) {
+                COLLAPSED.put(row, new int[]{lp.height, minHeight});
+            }
+            lp.height = 0;
+        }
+        // A minimum height would override the 0 above; none of the app's rows should have one, but
+        // the restore has to know about it either way.
+        row.setMinimumHeight(0);
+        row.setVisibility(View.GONE);
+        row.requestLayout();
+        return "hidden (format's own file; lp.height " + before + " -> 0, minHeight " + minHeight
+                + " -> 0, was " + wasMeasured + "px)";
     }
 
     /**

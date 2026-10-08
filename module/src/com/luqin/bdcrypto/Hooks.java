@@ -998,6 +998,24 @@ public final class Hooks {
 
     private static final String BUTTON_LABEL = "解锁";
 
+    /** The same button once the vault is open. It locks it again, so it says so. */
+    private static final String BUTTON_LABEL_UNLOCKED = "还原";
+
+    /**
+     * What the button on a page showing {@code pagePath} should read.
+     *
+     * <p>The label is state, not a constant: the same view unlocks a locked vault and re-locks an
+     * open one. Leaving it at "解锁" while the vault is already open made the button look like the
+     * first click had not worked. A probe override still wins — it exists precisely to try labels
+     * the module would not pick by itself.
+     */
+    private static String buttonLabelFor(String pagePath, String override) {
+        if (override != null && !override.isEmpty()) {
+            return override;
+        }
+        return VaultUi.isUnlockedFor(pagePath) ? BUTTON_LABEL_UNLOCKED : BUTTON_LABEL;
+    }
+
     /**
      * {@code btn} probe command: {@code off} removes the button from every page copy, {@code diag}
      * reports what each copy is showing and what is in it, anything else (re)injects it.
@@ -1257,8 +1275,11 @@ public final class Hooks {
                     existing = null;
                 }
             }
+            // Resolved here, not inside buildButton/restyle: it decides what the button *means* on
+            // this page, and both the fresh and the kept path have to agree on it.
+            final String effLabel = buttonLabelFor(paths[i], label);
             if (existing != null) {
-                restyle(existing, label, sizeSp);
+                restyle(existing, effLabel, sizeSp);
                 kept++;
                 sb.append("copy ").append(i).append(": ").append(paths[i]).append(" already has it")
                         .append(" at ").append(absRect(existing)).append(" alpha=")
@@ -1268,12 +1289,18 @@ public final class Hooks {
                 continue;
             }
 
-            android.widget.TextView b = buildButton(anchor, idSort, label, widthPx, sizeSp);
+            android.widget.TextView b = buildButton(anchor, idSort, effLabel, widthPx, sizeSp);
             int at = parent.indexOfChild(anchor);
             parent.addView(b, at, pillParams(anchor.getLayoutParams(), widthPx, b, parent));
             b.setOnClickListener(new android.view.View.OnClickListener() {
                 @Override
                 public void onClick(android.view.View v) {
+                    // One button, two actions, decided at click time rather than at attach time:
+                    // the page can be locked, unlocked and re-locked without the view being rebuilt.
+                    if (VaultUi.relock(vaultDir)) {
+                        Logx.i("[button] clicked -> 还原 for " + vaultDir);
+                        return;
+                    }
                     Logx.i("[button] clicked -> passphrase dialog for " + vaultDir);
                     // The button's own context IS the page's activity, which is what a dialog
                     // needs; the application context has no window token and throws.
@@ -1341,6 +1368,7 @@ public final class Hooks {
         Context themed = anchor.getContext() != null ? anchor.getContext() : app;
         android.widget.TextView b = new android.widget.TextView(themed);
         b.setTag(TAG_UNLOCK);
+        // `label` is already resolved by buttonLabelFor — this only guards the probe passing "".
         b.setText(label != null && !label.isEmpty() ? label : BUTTON_LABEL);
         b.setSingleLine(true);
         b.setClickable(true);
@@ -1580,7 +1608,7 @@ public final class Hooks {
      * "/content", but {@code dir} is always the full path the listing reported, so a suffix match
      * on the full string cannot be one.
      */
-    private static boolean samePath(String path, String dir) {
+    static boolean samePath(String path, String dir) {
         return path != null && dir != null
                 && (path.equals(dir) || path.endsWith(dir));
     }

@@ -124,6 +124,34 @@ public final class VaultUi {
         return session;
     }
 
+    /** True when this page is the vault that is currently open. */
+    public static boolean isUnlockedFor(String cloudDir) {
+        Session s = session;
+        // samePath, not equals: the path a page reports comes from its own breadcrumb, and the
+        // leading segments get recycled out of that RecyclerView (docs/recon.md §14.3).
+        return s != null && cloudDir != null && Hooks.samePath(cloudDir, s.cloudDir);
+    }
+
+    /**
+     * Closes the vault again, so the page goes back to showing the format's own file names.
+     *
+     * @return false when this page is not the open vault — the caller should unlock instead
+     */
+    public static boolean relock(String cloudDir) {
+        final Session s = session;
+        if (s == null || cloudDir == null || !Hooks.samePath(cloudDir, s.cloudDir)) {
+            return false;
+        }
+        session = null;
+        // The mirror of what unlockSync does, for the same reason: every row on the page was drawn
+        // while the session was live, so the page needs one more bind to put the ciphertext names,
+        // the sizes and the hidden rows back the way the app has them.
+        Hooks.reconcileSoon("relocked " + cloudDir);
+        Logx.i("[vault] relocked " + s.cloudDir + "; rows go back to ciphertext names");
+        Hooks.toast("BdCryptomator：已还原为密文目录");
+        return true;
+    }
+
     public static String stateLine() {
         Session s = session;
         if (s == null) {
