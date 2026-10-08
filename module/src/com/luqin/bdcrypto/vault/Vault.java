@@ -303,6 +303,26 @@ public final class Vault {
     }
 
     /**
+     * The directory id that a subdirectory entry folder names, read from its {@code dir.c9r}.
+     *
+     * <p>This is the one join in the whole format that is not one-way, and the redirect depends on
+     * it entirely: {@code d/XY/…} is named after {@code hashDirectoryId(dirId)}, and the hash cannot
+     * be run backwards, so the only way from "the folder the user tapped" to "where that folder's
+     * contents live" is to read this file. It is <em>cleartext</em> — 36 bytes of UUID — which is
+     * what makes the walk possible at all.
+     *
+     * <p>The file has to be on local disk before this is called. On the device that means fetching
+     * it through the app first ({@code Channel.fetch}): the entry folder holds nothing else, so the
+     * app has no reason to have it unless it was asked for.
+     *
+     * @param vaultRelativeEntryPath the entry folder, relative to the vault root — for example
+     *     {@code d/SY/RGEQ…/kymd….c9r}
+     */
+    public String childDirectoryId(String vaultRelativeEntryPath) throws IOException {
+        return childId(vaultRelativeEntryPath, vaultRelativeEntryPath);
+    }
+
+    /**
      * Checks {@code dirid.c9r} against the size the content model predicts for the id we already
      * know. It costs nothing and it binds a file that traversal does not otherwise need to the id
      * that traversal does need: if the id we walked with were wrong, this would disagree.

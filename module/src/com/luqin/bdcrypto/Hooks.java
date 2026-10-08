@@ -915,6 +915,11 @@ public final class Hooks {
         } else {
             sweepAllOurButtons(why + ", drawn page is " + drawn);
         }
+
+        // Last, so the page is dealt with exactly as before and a redirect is only ever an addition.
+        // A Cryptomator directory entry is a folder holding one dir.c9r; the files are elsewhere, and
+        // this is the moment the app has listed the one file that says where. See Nav.redirectEntry.
+        Nav.redirectEntry(ctx, drawn);
     }
 
     /** The known vault directory that {@code crumb} names, or null. Longest match wins. */

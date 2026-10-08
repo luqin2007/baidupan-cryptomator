@@ -4,10 +4,14 @@ import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 
+import java.io.File;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -358,6 +362,176 @@ final class Nav {
         }
         return sb.toString();
     }
+
+    // ------------------------------------------------------- redirect -----
+
+    /**
+     * The vault's own navigation fix: a tap on a Cryptomator directory must not stop at the entry
+     * folder.
+     *
+     * <p>A directory in this format is two unrelated places. The <em>entry</em> is a folder named
+     * {@code <base64url name>.c9r} in the parent, holding nothing but a {@code dir.c9r}; the
+     * <em>contents</em> sit under {@code d/<hashDirectoryId(dirId)>}, elsewhere entirely. Tapping the
+     * row therefore lands the user on a folder that appears empty, while the ninety files they
+     * wanted are somewhere the app has no reason to look. Measured on the device: the breadcrumb
+     * read {@code …/LZPM…==.c9r} and the page listed one row, {@code dir.c9r}, with the real
+     * contents at {@code d/DI/7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I}.
+     *
+     * <p><b>Why the redirect has to happen after the landing, and not instead of it.</b> The join
+     * from entry to contents is {@code dir.c9r}, and it cannot be read before the user gets there:
+     * the module may only download a file the app has itself listed ({@code Channel.fetch} borrows
+     * the app's download pipeline, which needs a {@code CloudFile} the app made), and the app has no
+     * reason to have listed {@code dir.c9r} until somebody opens the folder it lives in. So the
+     * sequence is: the app lands, lists one row, and <em>then</em> the module can resolve and move
+     * on. A first visit therefore shows the entry folder for as long as the fetch takes.
+     *
+     * <p>{@link #oncePerPath} is what keeps this from being a trap. The entry folder stays in the
+     * back stack, so pressing back returns to it and reconcile runs again; without the guard it
+     * would shove the user forward every time and back would never get out. One redirect per entry
+     * folder per session means back lands on the entry folder and stays there — a wart, not a trap,
+     * and the alternative (replacing the level rather than pushing) is a separate question about
+     * {@code changeViewLevel}.
+     */
+    private static final long ENTRY_FETCH_TIMEOUT_MS = 8000;
+
+    /** Entry folders already redirected from, so back-navigation does not shove the user forward. */
+    private static final Set<String> oncePerPath =
+            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    /** Entry cloud path -> the child directory id its {@code dir.c9r} named. */
+    private static final Map<String, String> entryDirIds = new ConcurrentHashMap<String, String>();
+
+    /**
+     * Called from the breadcrumb reconcile with the directory the drawn page is on.
+     *
+     * <p>Returns immediately for every page that is not a Cryptomator entry folder, which is almost
+     * all of them: two string tests and a null check.
+     */
+    static void redirectEntry(Context ctx, String drawn) {
+        final VaultUi.Session session = VaultUi.session();
+        if (session == null || drawn == null || !drawn.endsWith(".c9r")) {
+            return;
+        }
+        final String entryCipher = drawn.substring(drawn.lastIndexOf('/') + 1);
+        // The parent is the page the user came from, and its id is what names the entry: this is the
+        // only moment that page is still the drawn one.
+        final String parentDirId = session.dirIdOfDrawn(drawn.substring(0, drawn.lastIndexOf('/')));
+        if (parentDirId == null) {
+            if (warnedOnce.add(drawn)) {
+                Logx.i("[nav] " + drawn + " is an entry folder but its parent is not a directory "
+                        + "this session can name (knows " + session.knownPaths() + ")");
+            }
+            return;
+        }
+        // Where the entry sits, taken from the id rather than from the breadcrumb. Parsing the
+        // breadcrumb would be the obvious source and is wrong: a page reached in one navigation
+        // shows one crumb, so the leading d/XY/ of the content path is simply not on screen.
+        final String parentContent = session.contentPathOf(parentDirId);
+        if (parentContent == null) {
+            return;
+        }
+        if (!oncePerPath.add(drawn)) {
+            return;
+        }
+        final String entryRelative = parentContent + "/" + entryCipher;
+        final String entryCloudPath = session.cloudDir + "/" + entryRelative;
+        Thread worker = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    redirectOnWorker(session, drawn, entryCloudPath, entryRelative, entryCipher,
+                            parentDirId);
+                } catch (Throwable t) {
+                    Logx.w("[nav] redirect of " + drawn + " failed: " + t);
+                }
+            }
+        }, "bdcrypto-redirect");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private static void redirectOnWorker(VaultUi.Session session, String drawn, String entryCloudPath,
+                                         String entryRelative, String entryCipher,
+                                         String parentDirId) {
+        File dirIdFile = Channel.fetch(entryCloudPath + "/dir.c9r", ENTRY_FETCH_TIMEOUT_MS);
+        if (dirIdFile == null) {
+            Logx.w("[nav] " + entryCloudPath + "/dir.c9r did not arrive; staying on the entry folder");
+            return;
+        }
+        String childDirId;
+        try {
+            childDirId = session.vault.childDirectoryId(entryRelative);
+        } catch (Throwable t) {
+            Logx.w("[nav] " + entryRelative + "/dir.c9r did not read as an id: " + t);
+            return;
+        }
+        if (childDirId == null) {
+            Logx.w("[nav] " + entryRelative + " names no child id");
+            return;
+        }
+        String relContent;
+        try {
+            relContent = session.vault.contentPath(childDirId);
+        } catch (Throwable t) {
+            Logx.w("[nav] cannot place " + childDirId + ": " + t);
+            return;
+        }
+        // Registered before the move, because the new page binds its rows the moment it is created
+        // and an unregistered path is a page of ciphertext names.
+        session.remember(relContent, childDirId);
+        // ...and under the name its breadcrumb will actually show. The page is reached in one
+        // navigation from anywhere, so the crumb reads the last segment of the content path only;
+        // see Session.dirIdByAlias for why whole-path matching turns up nothing here.
+        session.alias(lastSegment(relContent), childDirId);
+        String realName = null;
+        if (parentDirId != null) {
+            try {
+                realName = session.vault.name(parentDirId, entryCipher);
+            } catch (Throwable t) {
+                Logx.w("[nav] " + entryCipher + " does not name a cleartext entry: " + t);
+            }
+        }
+        if (realName != null && realName.length() > 0) {
+            session.alias(realName, childDirId);
+        }
+        entryDirIds.put(entryCloudPath, childDirId);
+
+        final String target = session.cloudDir + "/" + relContent;
+        Logx.i("[nav] " + drawn + " -> " + target + " (dirId " + childDirId + ", \""
+                + (realName == null ? "?" : realName) + "\")");
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Object frag = fileListFragment();
+                    if (frag == null) {
+                        Logx.w("[nav] the page went away before the redirect could be made");
+                        return;
+                    }
+                    Object file = fabricate(target, true);
+                    Method m = descendMethod(frag.getClass());
+                    if (m == null) {
+                        Logx.w("[nav] no way to descend on " + frag.getClass().getName());
+                        return;
+                    }
+                    invokeDescend(m, frag, file);
+                    Logx.i("[nav] redirected to " + target);
+                } catch (Throwable t) {
+                    Logx.w("[nav] redirect to " + target + " failed: " + t);
+                }
+            }
+        });
+    }
+
+    /** The last path segment — the name a breadcrumb would show for a directory reached in one hop. */
+    private static String lastSegment(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash < 0 ? path : path.substring(slash + 1);
+    }
+
+    /** Entry folders already reported as unresolvable, so a quarter-second loop does not spam. */
+    private static final Set<String> warnedOnce =
+            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
     /** Unused today, kept deliberately: the callback field is how the negative result was found. */
     static Field callbackField(Class<?> adapter) {

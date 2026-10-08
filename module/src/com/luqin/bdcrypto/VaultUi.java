@@ -53,17 +53,46 @@ public final class VaultUi {
         public final File localDir;
         public final Vault vault;
         private final Map<String, String> dirIdByContent = new ConcurrentHashMap<String, String>();
+        private final Map<String, String> contentByDirId = new ConcurrentHashMap<String, String>();
+
+        /**
+         * Directory ids keyed by something a page may be <em>showing</em>.
+         *
+         * <p>Needed because a page's breadcrumb is built from the navigation the user performed, not
+         * from the path it landed on: a jump straight from {@code /crypto/content} to
+         * {@code d/DI/7HKQ…} adds exactly one crumb, so the crumb reads {@code …/7HKQ…} and the
+         * {@code d/DI} in between is nowhere on screen. Matching only against whole content paths
+         * therefore turns up nothing on every page the redirect produces — which is every page that
+         * matters.
+         */
+        private final Map<String, String> dirIdByAlias = new ConcurrentHashMap<String, String>();
 
         Session(String cloudDir, File localDir, Vault vault) throws IOException {
             this.cloudDir = cloudDir;
             this.localDir = localDir;
             this.vault = vault;
-            dirIdByContent.put(vault.rootContentPath(), "");
+            String root = vault.rootContentPath();
+            remember(root, "");
+            // The root content directory is also reachable in one navigation — from the vault root,
+            // or by a jump — and then its crumb is just the last segment of its own path. Without
+            // this the very first page of the decrypted tree would draw as ciphertext names, which
+            // is the one page nobody can afford to get wrong.
+            alias(lastSegmentOf(root), "");
+        }
+
+        private static String lastSegmentOf(String path) {
+            int slash = path.lastIndexOf('/');
+            return slash < 0 ? path : path.substring(slash + 1);
         }
 
         /** The id of the directory whose ciphertext sits at this vault-relative path, or null. */
         public String dirIdOf(String vaultRelativeContentPath) {
             return dirIdByContent.get(vaultRelativeContentPath);
+        }
+
+        /** Where {@code dirId}'s entries live, relative to the vault root — the reverse lookup. */
+        public String contentPathOf(String dirId) {
+            return contentByDirId.get(dirId);
         }
 
         /**
@@ -86,12 +115,14 @@ public final class VaultUi {
             }
             String bestPath = null;
             String bestDirId = null;
-            for (Map.Entry<String, String> e : dirIdByContent.entrySet()) {
-                String path = "/" + e.getKey();
-                if (drawn.equals(path) || drawn.endsWith(path)) {
-                    if (bestPath == null || path.length() > bestPath.length()) {
-                        bestPath = path;
-                        bestDirId = e.getValue();
+            for (Map<String, String> byKey : java.util.Arrays.asList(dirIdByContent, dirIdByAlias)) {
+                for (Map.Entry<String, String> e : byKey.entrySet()) {
+                    String path = "/" + e.getKey();
+                    if (drawn.equals(path) || drawn.endsWith(path)) {
+                        if (bestPath == null || path.length() > bestPath.length()) {
+                            bestPath = path;
+                            bestDirId = e.getValue();
+                        }
                     }
                 }
             }
@@ -105,6 +136,15 @@ public final class VaultUi {
 
         public void remember(String vaultRelativeContentPath, String dirId) {
             dirIdByContent.put(vaultRelativeContentPath, dirId);
+            contentByDirId.put(dirId, vaultRelativeContentPath);
+        }
+
+        /**
+         * Registers another reading of the same directory — the name a jumped-to page will actually
+         * show in its breadcrumb. See {@link #dirIdByAlias}.
+         */
+        public void alias(String key, String dirId) {
+            dirIdByAlias.put(key, dirId);
         }
 
         /**
