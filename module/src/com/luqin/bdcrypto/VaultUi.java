@@ -10,7 +10,9 @@ import com.luqin.bdcrypto.vault.Vault;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -67,6 +69,54 @@ public final class VaultUi {
          */
         private final Map<String, String> dirIdByAlias = new ConcurrentHashMap<String, String>();
 
+        /**
+         * What each directory is called, keyed by directory id.
+         *
+         * <p>The breadcrumb cannot be derived from the path and cannot be read off the page: a
+         * directory inside a vault is reached by a jump, so its crumb is <em>a hash of its id</em>,
+         * and that hash is one-way. The cleartext name exists in exactly one place — the entry the
+         * user tapped, which is decrypted when the redirect resolves it — so it is written down
+         * here, at the one moment it is known.
+         */
+        private final Map<String, String> nameByDirId = new ConcurrentHashMap<String, String>();
+
+        /**
+         * Entry folders this session has already redirected from.
+         *
+         * <p>Session-scoped, and that is the whole point of it living here rather than beside the
+         * redirect that fills it. Measured: 还原 then unlocking again, then tapping the same
+         * directory, opened the entry folder and left the user staring at {@code dir.c9r} — a
+         * module-static set had no memory of the lock, so the second tap looked like the first.
+         * One redirect per entry folder is still the rule; the rule just has to end with the
+         * session, or 还原 is not a way back to the beginning.
+         */
+        private final Set<String> redirected =
+                Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+        /**
+         * Whether the vault is still open. Cleared by {@link VaultUi#relock}, which keeps the
+         * session rather than dropping it — see there for why the module needs to remember a vault
+         * it is no longer decrypting.
+         */
+        private volatile boolean locked;
+
+        /** False once the vault has been closed again; the paths and ids stay known either way. */
+        public boolean isUnlocked() {
+            return !locked;
+        }
+
+        /** True the first time this path is claimed in this session. */
+        public boolean claimRedirect(String path) {
+            return redirected.add(path);
+        }
+
+        /** Records what a directory is called, so its breadcrumb can read as the user's own name. */
+        public void nameDir(String dirId, String cleartext) {
+            if (dirId != null && cleartext != null && cleartext.length() > 0) {
+                nameByDirId.put(dirId, cleartext);
+            }
+        }
+        
         Session(String cloudDir, File localDir, Vault vault) throws IOException {
             this.cloudDir = cloudDir;
             this.localDir = localDir;
@@ -88,6 +138,29 @@ public final class VaultUi {
         /** The id of the directory whose ciphertext sits at this vault-relative path, or null. */
         public String dirIdOf(String vaultRelativeContentPath) {
             return dirIdByContent.get(vaultRelativeContentPath);
+        }
+
+        /**
+         * Takes over what another session learnt about this same vault's directories.
+         *
+         * <p>Needed because 还原 no longer drops the session's <em>knowledge</em>, only its
+         * decryption: unlocking again from inside the tree builds a fresh session, and a fresh
+         * session knows exactly one directory — the root. Measured, that left the page the user was
+         * standing on unrecognisable: {@code d/DI/7HKQ…} is named after a one-way hash of its id, so
+         * the module cannot work it out again, and every row on it stayed ciphertext with the
+         * unlock button swept off the toolbar.
+         *
+         * <p>Nothing about the vault's structure changes by locking it, so the ids, the two
+         * spellings of each path, and the cleartext names all still hold. What is deliberately
+         * <em>not</em> inherited is which entries have been redirected from
+         * ({@link #redirected}): that is per-visit bookkeeping, and carrying it over is what made a
+         * second tap on 游戏 open the pointer folder and stop there.
+         */
+        public void inheritFrom(Session other) {
+            dirIdByContent.putAll(other.dirIdByContent);
+            contentByDirId.putAll(other.contentByDirId);
+            dirIdByAlias.putAll(other.dirIdByAlias);
+            nameByDirId.putAll(other.nameByDirId);
         }
 
         /** Where {@code dirId}'s entries live, relative to the vault root — the reverse lookup. */
@@ -134,6 +207,83 @@ public final class VaultUi {
             return dirIdByContent.keySet().toString();
         }
 
+        // --- what a breadcrumb segment is, in this vault's own terms ---------------------------
+
+        /** A name that means nothing to this vault: the app's own directory, or another app's. */
+        public static final int CRUMB_FOREIGN = 0;
+
+        /** {@code d} — the one bucket root every vault has, holding nothing but bucket folders. */
+        public static final int CRUMB_BUCKET_ROOT = 1;
+
+        /** A two-character bucket under {@code d}; the format splits directories across these. */
+        public static final int CRUMB_BUCKET = 2;
+
+        /** {@code d/XY/<hash>} — where a directory's entries actually live. */
+        public static final int CRUMB_CONTENT = 3;
+
+        /** {@code <base64url>.c9r} — the pointer folder that stands in for a directory. */
+        public static final int CRUMB_ENTRY = 4;
+
+        /**
+         * Classifies a breadcrumb segment, so the breadcrumb can be shown as a path the user
+         * walked rather than as the path the format stores.
+         *
+         * <p>The three content shapes are matched against this session's own knowledge rather than
+         * by length or alphabet, which is what makes this safe to run on <em>every</em> page: a
+         * hash only counts as a content directory if this session has descended into it, and a
+         * bucket name only counts if a content path this session knows runs through it. A directory
+         * of the user's that happens to be called {@code d} or {@code AB} is therefore left alone
+         * unless it is one of these — and since a segment inside a vault is always a ciphertext
+         * name, the vault's own pages can never collide with a cleartext one.
+         */
+        public int crumbKind(String name) {
+            if (name == null || name.length() == 0) {
+                return CRUMB_FOREIGN;
+            }
+            // Checked first: an alias may be a cleartext name this session recorded, so a crumb
+            // this module has already renamed classifies the same way on the next bind.
+            if (dirIdByAlias.containsKey(name)) {
+                return CRUMB_CONTENT;
+            }
+            if ("d".equals(name)) {
+                return CRUMB_BUCKET_ROOT;
+            }
+            if (name.endsWith(".c9r")) {
+                return CRUMB_ENTRY;
+            }
+            return isBucketName(name) ? CRUMB_BUCKET : CRUMB_FOREIGN;
+        }
+
+        /** Whether {@code name} is the second segment of any content path this session has seen. */
+        public boolean isBucketName(String name) {
+            if (name.length() != 2) {
+                return false;
+            }
+            for (String path : dirIdByContent.keySet()) {
+                int first = path.indexOf('/');
+                if (first < 0 || path.length() < first + 3) {
+                    continue;
+                }
+                if (path.charAt(first + 1) == name.charAt(0)
+                        && path.charAt(first + 2) == name.charAt(1)
+                        && (path.length() == first + 3 || path.charAt(first + 3) == '/')) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * What a crumb naming this directory should read, or null when it should not be shown.
+         *
+         * <p>Null for the vault's own root on purpose. Its content directory is where the user
+         * already is once the vault is open, so a crumb for it would be a level that does not
+         * exist in the user's mind — and its name is a hash nobody asked to see.
+         */
+        public String nameOfDirId(String dirId) {
+            return dirId == null || dirId.length() == 0 ? null : nameByDirId.get(dirId);
+        }
+
         public void remember(String vaultRelativeContentPath, String dirId) {
             dirIdByContent.put(vaultRelativeContentPath, dirId);
             contentByDirId.put(dirId, vaultRelativeContentPath);
@@ -169,24 +319,43 @@ public final class VaultUi {
         Session s = session;
         // samePath, not equals: the path a page reports comes from its own breadcrumb, and the
         // leading segments get recycled out of that RecyclerView (docs/recon.md §14.3).
-        return s != null && cloudDir != null && Hooks.samePath(cloudDir, s.cloudDir);
+        return s != null && s.isUnlocked() && cloudDir != null && Hooks.samePath(cloudDir, s.cloudDir);
     }
 
     /**
      * Closes the vault again, so the page goes back to showing the format's own file names.
      *
+     * <p><b>The session survives, marked locked, and that is the point of it.</b> Unlocking sends
+     * the user into the decrypted tree — a directory that the vault's own page is not an ancestor
+     * of — so 还原 pressed from in there used to leave them on a page of hashes with the unlock
+     * button gone and nothing to press: the button is placed on pages this module can name, and the
+     * name came from the session. Keeping the names while dropping the decryption is what lets the
+     * button read 解锁 in the middle of the tree and open the vault again from where the user
+     * actually is.
+     *
+     * <p>The alternative — walking the page back to the vault's own directory — was tried and
+     * measured worse: the app answered it by loading that directory's <em>contents</em> without
+     * redrawing its breadcrumb, so the page listed {@code d/} and {@code masterkey.cryptomator}
+     * under a crumb still reading the directory just left, and every decision the module makes is
+     * taken from the breadcrumb. Nothing here moves the page; the way back is the app's own crumb,
+     * which is on screen and does work.
+     *
      * @return false when this page is not the open vault — the caller should unlock instead
      */
     public static boolean relock(String cloudDir) {
         final Session s = session;
-        if (s == null || cloudDir == null || !Hooks.samePath(cloudDir, s.cloudDir)) {
+        if (s == null || !s.isUnlocked() || cloudDir == null
+                || !Hooks.samePath(cloudDir, s.cloudDir)) {
             return false;
         }
-        session = null;
+        s.locked = true;
         // The mirror of what unlockSync does, for the same reason: every row on the page was drawn
         // while the session was live, so the page needs one more bind to put the ciphertext names,
         // the sizes and the hidden rows back the way the app has them.
         Hooks.reconcileSoon("relocked " + cloudDir);
+        // ...and the breadcrumb, which has no bind coming: no page navigates when the vault is
+        // locked, so a crumb this module renamed would go on showing a name the user cannot act on.
+        Crumb.release();
         Logx.i("[vault] relocked " + s.cloudDir + "; rows go back to ciphertext names");
         Hooks.toast("BdCryptomator：已还原为密文目录");
         return true;
@@ -197,7 +366,8 @@ public final class VaultUi {
         if (s == null) {
             return "locked (no vault unlocked)";
         }
-        return "unlocked: cloud=" + s.cloudDir + " local=" + s.localDir.getAbsolutePath()
+        return (s.isUnlocked() ? "unlocked: " : "locked (names still known): ")
+                + "cloud=" + s.cloudDir + " local=" + s.localDir.getAbsolutePath()
                 + " format=" + s.vault.format() + " " + s.vault.cipherCombo()
                 + " root=" + safeRoot(s);
     }
@@ -298,7 +468,13 @@ public final class VaultUi {
         }
         File localDir = Channel.localFileFor(cloudDir);
         Vault vault = Vault.open(localDir, passphrase);
+        final Session previous = session;
         session = new Session(cloudDir, localDir, vault);
+        if (previous != null && Hooks.samePath(previous.cloudDir, cloudDir)) {
+            // Same vault, unlocked again — possibly from inside the tree, where 还原 left the user.
+            // The directory ids it had worked out are still the right ones. See inheritFrom.
+            session.inheritFrom(previous);
+        }
         // Every row of the page the user is standing on now has a cleartext name, but the page was
         // bound before that was true — ask for one reconcile pass, which rebinds the rows.
         Hooks.reconcileSoon("unlocked " + cloudDir);

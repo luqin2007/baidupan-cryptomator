@@ -382,11 +382,14 @@ final class Nav {
      */
     static void redirectVaultRoot(Context ctx, String drawn) {
         final VaultUi.Session session = VaultUi.session();
-        if (session == null || drawn == null || !Hooks.samePath(drawn, session.cloudDir)) {
+        // isUnlocked, because the session outlives 还原: a locked vault still knows its paths, and
+        // acting on that would drag the user straight back into the tree they just asked to leave.
+        if (session == null || !session.isUnlocked() || drawn == null
+                || !Hooks.samePath(drawn, session.cloudDir)) {
             return;
         }
         final String root = session.contentPathOf("");
-        if (root == null || !oncePerPath.add(drawn)) {
+        if (root == null || !session.claimRedirect(drawn)) {
             return;
         }
         final String target = session.cloudDir + "/" + root;
@@ -414,6 +417,77 @@ final class Nav {
     }
 
     /**
+     * Rescues a page that is inside the vault but on a directory this session cannot name.
+     *
+     * <p>The redirects put the user where the files are, and those directories are named after a
+     * one-way hash of their id — so the only way to know one is to have gone through it. A session
+     * that has just been created (unlocked) therefore cannot read the page it was unlocked from,
+     * and neither can one that comes back after the app was restarted: measured, the rows stay
+     * ciphertext and the toolbar loses its button, because both are placed from the directory id.
+     *
+     * <p>{@link VaultUi.Session#inheritFrom} covers the ordinary case — the same vault unlocked
+     * again, whose ids are still known. This covers the rest, by taking the user to the one
+     * directory every session can name: the decrypted root.
+     *
+     * <p>Claimed like the other redirects, so a page that cannot be read is left alone after one
+     * attempt rather than being pushed to on every quarter-second pass.
+     */
+    static void recoverIfStranded(Context ctx, String drawn) {
+        final VaultUi.Session session = VaultUi.session();
+        if (session == null || !session.isUnlocked() || drawn == null
+                || session.dirIdOfDrawn(drawn) != null || !looksInsideVault(drawn)) {
+            return;
+        }
+        if (!session.claimRedirect("stranded:" + drawn)) {
+            return;
+        }
+        final String root = session.contentPathOf("");
+        if (root == null) {
+            return;
+        }
+        final String target = session.cloudDir + "/" + root;
+        Logx.i("[nav] " + drawn + " is inside the vault but not a directory this session can name"
+                + " -> opening " + target);
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Object frag = fileListFragment();
+                    Method m = frag == null ? null : descendMethod(frag.getClass());
+                    if (m == null) {
+                        return;
+                    }
+                    invokeDescend(m, frag, fabricate(target, true));
+                    settleAfterRedirect("");
+                } catch (Throwable t) {
+                    Logx.w("[nav] cannot recover " + drawn + ": " + t);
+                }
+            }
+        });
+    }
+
+    /**
+     * Whether a breadcrumb's path ends somewhere a Cryptomator tree would put it.
+     *
+     * <p>Shape only, and deliberately conservative: {@code d/XY/<hash>} or anything holding a
+     * {@code .c9r}. Both are strong enough that an ordinary directory of the user's is not going to
+     * match by accident, and a false negative costs nothing — the page is left as the app drew it,
+     * which is what happens today.
+     */
+    private static boolean looksInsideVault(String drawn) {
+        if (drawn.contains(".c9r")) {
+            return true;
+        }
+        String[] seg = drawn.split("/");
+        for (int i = 0; i + 2 < seg.length; i++) {
+            if ("d".equals(seg[i]) && seg[i + 1].length() == 2 && seg[i + 2].length() == 30) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * The vault's own navigation fix: a tap on a Cryptomator directory must not stop at the entry
      * folder.
      *
@@ -433,21 +507,19 @@ final class Nav {
      * sequence is: the app lands, lists one row, and <em>then</em> the module can resolve and move
      * on. A first visit therefore shows the entry folder for as long as the fetch takes.
      *
-     * <p>{@link #oncePerPath} is what keeps this from being a trap. The entry folder stays in the
-     * back stack, so pressing back returns to it and reconcile runs again; without the guard it
-     * would shove the user forward every time and back would never get out. One redirect per entry
-     * folder per session means back lands on the entry folder and stays there — a wart, not a trap,
-     * and the alternative (replacing the level rather than pushing) is a separate question about
-     * {@code changeViewLevel}.
+     * <p>{@link VaultUi.Session#claimRedirect} is what keeps this from being a trap. The entry
+     * folder stays in the back stack, so pressing back returns to it and reconcile runs again;
+     * without the guard it would shove the user forward every time and back would never get out.
+     * One redirect per entry folder means back lands on the entry folder and stays there — a wart,
+     * not a trap, and the alternative (replacing the level rather than pushing) is a separate
+     * question about {@code changeViewLevel}.
+     *
+     * <p>The guard is held by the session rather than by this class, and that is not tidiness:
+     * measured, a module-static set survived a 还原 followed by a fresh unlock, and the second tap
+     * on 游戏 opened the pointer folder holding {@code dir.c9r} and left it there. 还原 has to be a
+     * way back to the beginning.
      */
     private static final long ENTRY_FETCH_TIMEOUT_MS = 8000;
-
-    /** Entry folders already redirected from, so back-navigation does not shove the user forward. */
-    private static final Set<String> oncePerPath =
-            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
-
-    /** Entry cloud path -> the child directory id its {@code dir.c9r} named. */
-    private static final Map<String, String> entryDirIds = new ConcurrentHashMap<String, String>();
 
     /**
      * Called from the breadcrumb reconcile with the directory the drawn page is on.
@@ -457,7 +529,9 @@ final class Nav {
      */
     static void redirectEntry(Context ctx, String drawn) {
         final VaultUi.Session session = VaultUi.session();
-        if (session == null || drawn == null || !drawn.endsWith(".c9r")) {
+        // isUnlocked: a vault that has been put back to ciphertext must keep showing ciphertext,
+        // including the pointer folders — that is what the user asked for by pressing 还原.
+        if (session == null || !session.isUnlocked() || drawn == null || !drawn.endsWith(".c9r")) {
             return;
         }
         final String entryCipher = drawn.substring(drawn.lastIndexOf('/') + 1);
@@ -478,7 +552,7 @@ final class Nav {
         if (parentContent == null) {
             return;
         }
-        if (!oncePerPath.add(drawn)) {
+        if (!session.claimRedirect(drawn)) {
             return;
         }
         final String entryRelative = parentContent + "/" + entryCipher;
@@ -541,8 +615,11 @@ final class Nav {
         }
         if (realName != null && realName.length() > 0) {
             session.alias(realName, childDirId);
+            // ...and so the breadcrumb of the page about to be opened can say 游戏 instead of
+            // 7HKQI7Z3NKNZLTDHRZXUKNCD5URD4I. This is the only moment that name exists anywhere the
+            // module can see: the entry the user tapped, read back through the vault.
+            session.nameDir(childDirId, realName);
         }
-        entryDirIds.put(entryCloudPath, childDirId);
 
         final String target = session.cloudDir + "/" + relContent;
         final String targetDirId = childDirId;

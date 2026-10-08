@@ -339,6 +339,11 @@ public final class Hooks {
                     safe("BreadcrumbAdapter.onBindViewHolder", new Body() {
                         @Override
                         public void run() {
+                            // The crumb is both the trigger and the thing shown wrongly: an
+                            // unlocked vault's path is the app's ciphertext path, so it is put
+                            // into the user's terms here, before the page is judged.
+                            Crumb.onBound(param.args == null || param.args.length == 0
+                                    ? null : param.args[0]);
                             // Once per crumb item, so two or three times per directory change; the
                             // pending flag in reconcileSoon collapses them into one pass.
                             reconcileSoon("breadcrumb bound");
@@ -944,6 +949,9 @@ public final class Hooks {
         // the same problem: the page the app opened is not the page that has the user's files.
         Nav.redirectVaultRoot(ctx, drawn);
         Nav.redirectEntry(ctx, drawn);
+        // And, if a page turned out to be inside a vault that cannot name it — unlocked from within
+        // the tree, or left there by a restart — take it somewhere the session does know.
+        Nav.recoverIfStranded(ctx, drawn);
     }
 
     /**
@@ -1633,7 +1641,14 @@ public final class Hooks {
             return null;
         }
         List<String> names = new ArrayList<String>();
-        collectTexts(crumb, names);
+        // The adapter's own list first, and the text views only as a fallback. A breadcrumb is a
+        // RecyclerView: it holds the crumbs that fit and nothing else, so reading its text loses
+        // whichever end has scrolled away — measured, the tail, which is the directory the page is
+        // on. Every directory lookup here is a suffix match, so a path missing its tail resolves to
+        // an ancestor instead of failing, and the rows are then decrypted with the wrong key.
+        if (!Crumb.wholePath(crumb, names)) {
+            collectTexts(crumb, names);
+        }
         if (names.isEmpty()) {
             return null;
         }
@@ -1717,7 +1732,12 @@ public final class Hooks {
             return;
         }
         if (v instanceof android.widget.TextView) {
-            CharSequence t = ((android.widget.TextView) v).getText();
+            android.widget.TextView tv = (android.widget.TextView) v;
+            // A crumb this module has renamed reads as the name underneath, not as the one it is
+            // showing: everything downstream — which directory is drawn, whether the button belongs
+            // here, whether a redirect is still owed — is about the app's own path.
+            String original = Crumb.originalOf(tv);
+            CharSequence t = original != null ? original : tv.getText();
             if (t != null && t.length() > 0) {
                 out.add(t.toString().trim());
             }

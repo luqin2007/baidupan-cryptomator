@@ -86,6 +86,9 @@ public final class VaultList {
     /** The session the last reconcile saw, so a fresh unlock can force a rebind. */
     private static volatile VaultUi.Session lastSessionSeen;
 
+    /** ...and whether it was open at the time, which changes rows without changing the session. */
+    private static volatile boolean lastUnlockedSeen;
+
     private static volatile boolean loggedFailure;
 
     private static volatile int nameId;
@@ -203,16 +206,19 @@ public final class VaultList {
     /**
      * Told by the button's reconcile pass which directory the window is actually drawing.
      *
-     * @return true when the rows need binding again: the page moved, or a different vault is
-     *     unlocked than the last time this was asked (unlocking while standing in the vault root
-     *     changes every row without changing the directory)
+     * @return true when the rows need binding again: the page moved, or the vault's state changed
+     *     (unlocking while standing in the vault root changes every row without changing the
+     *     directory, and so does locking it again — the session object survives that, so the
+     *     unlocking flag has to be compared as well as the reference)
      */
     static boolean noteDrawnPath(String cloudPath) {
         boolean changed = drawnCloudPath == null ? cloudPath != null : !drawnCloudPath.equals(cloudPath);
         drawnCloudPath = cloudPath;
         VaultUi.Session session = VaultUi.session();
-        if (session != lastSessionSeen) {
+        boolean unlocked = session != null && session.isUnlocked();
+        if (session != lastSessionSeen || unlocked != lastUnlockedSeen) {
             lastSessionSeen = session;
+            lastUnlockedSeen = unlocked;
             changed = true;
         }
         return changed;
@@ -230,8 +236,11 @@ public final class VaultList {
         // bind has already written its text, and the geometry has to be the app's again too.
         uncollapseRow(row);
         VaultUi.Session session = VaultUi.session();
-        if (session == null) {
-            logBind(textOf(row), "no vault unlocked in this process");
+        if (session == null || !session.isUnlocked()) {
+            // The session survives 还原 marked locked, so "which vault" and "is it open" are two
+            // different questions and the row rewriting is only about the second.
+            logBind(textOf(row), session == null ? "no vault unlocked in this process"
+                    : "the vault has been put back to ciphertext (还原)");
             return;
         }
         String dirId = session.dirIdOfDrawn(drawnCloudPath);
