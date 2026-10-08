@@ -629,12 +629,18 @@ manager 实例，模块留住它们、之后用它们发起自己的下载。这
 
 ### 11.4 保险库 oracle（离线，已逐字节验证）
 
-密码 **`f_EqfhYmWxAMq!!dmL_3` 确认正确** —— 不是靠"能解开"这种间接证据，而是手工重做
+密码 **已确认正确**（口令本身不写进仓库，见下）—— 不是靠"能解开"这种间接证据，而是手工重做
 scrypt + 两次 AES-KW 解包 + 校验 `versionMac`，逐字节吻合：
 
 ```
 versionMac = HMAC-SHA256(hmacMasterKey, version 的 4 字节大端)   # version = 999
 ```
+
+> ⚠️ **口令不要提交进仓库。** 本文档早先的版本把这个真实保险库的口令写在了这里，并已经推到
+> 公开仓库（提交 `89ac7e4` / `7008352`）。已经写入 git 历史的东西**改工作区是删不掉的**，
+> 唯一可靠的处理是**换口令**（Cryptomator 里改保险库密码）。此后所有示例一律用
+> `<passphrase>` 占位。`p0d-fixture` 那个口令可以留在文档里 —— 它是本工具生成的测试保险库，
+> 内容是确定性造出来的，不含任何真实数据。
 
 顺带确认的 spec 细节（`D:/cryptomator/baidu`，format 8 / SIV_GCM / shorteningThreshold 220）：
 
