@@ -107,7 +107,7 @@ APK 里存在 `libnetdisk-signature-check.so`、`libbaiduprotect_sec.so`、`libm
 
 | 阶段 | 内容 | 验收标准 | 状态 |
 |---|---|---|---|
-| **P0** | 模块骨架 + 运行时探针 + 内容通道侦察 + 打包可行性验证 | 模块能装进 App 进程；探针能吐出全部目标类的**真实签名**；cryptolib 能进 dex | 🟡 P0-A/C 通过；**P0-B 捕获层已装、重放待验**（阻塞：存储权限）；P0-D 未做——见 `docs/recon.md` §11.7 |
+| **P0** | 模块骨架 + 运行时探针 + 内容通道侦察 + 打包可行性验证 | 模块能装进 App 进程；探针能吐出全部目标类的**真实签名**；cryptolib 能进 dex | 🟡 P0-A/C/D 完成；**P0-B 捕获层已装、重放待验**（阻塞：存储权限）——见 `docs/recon.md` §11.7 |
 | **P1** | 在工具栏注入「解密」按钮，仅当当前目录含 `vault.cryptomator` 时显示 | 进出保险库目录按钮出现 / 消失；点击弹出口令输入 | ⬜ |
 | **P2** | 虚拟解密目录（核心）：scrypt → AES-KW 解主密钥（**仅内存**），解 SIV 文件名，读 `dirid.c9r` 拿子目录 ID，接管导航与面包屑 | 与 Cryptomator 桌面版逐条对照，中文名 / 空格 / 多级目录全一致 | ⬜ |
 | **P3** | 下载自动解密：劫持下载完成点，就地解密并还原真实文件名 | 下载 → 拿到可打开的明文 | ⬜ |
@@ -245,8 +245,25 @@ module/
   tools/fetch-libs.sh         取 AGPL 运行期依赖
   build.sh                    全流程构建
 tools/dexdump.py              离线 dex 逆向工具
+tools/oracle/                 桌面端 Cryptomator 参考工具：验口令 / 出明文清单 / 造测试保险库
 docs/recon.md                 侦察原始记录
 ```
+
+### `tools/oracle/`
+
+模块不能打包 `cryptofs`（要 `java.nio.file`、guava、jackson），目录遍历必须自己实现。
+这个目录下三个程序用**官方** cryptolib + cryptofs 在桌面 JVM 上做同一件事，因此是那套自研
+实现的裁判，同时给出每个密文文件**应有的明文**：
+
+```bash
+tools/oracle/oracle.sh check  <保险库> '<口令>'    # 口令对不对（手工重做 scrypt + AES-KW + versionMac）
+tools/oracle/oracle.sh unlock <保险库> '<口令>'    # 明文 <-> 密文对照清单
+tools/oracle/oracle.sh make   <保险库> '<口令>'    # 造 P0-D 测试保险库
+```
+
+需要 **JDK 25**（cryptofs 是 class file 69）与本地 Cryptomator 安装的 jar。
+保险库结构与体积模型的实测结论见 [`docs/recon.md`](docs/recon.md) §12 与
+[`tools/oracle/README.md`](tools/oracle/README.md)。
 
 ### `tools/dexdump.py`
 

@@ -644,7 +644,7 @@ versionMac = HMAC-SHA256(hmacMasterKey, version 的 4 字节大端)   # version 
 | `primaryMasterKey` / `hmacMasterKey` | 各 AES-KW 包裹 40 B → 明文 32 B |
 | **pepper** | **必须是空数组**（见下） |
 | 明文根 `/` 的密文位置 | **`d/SY/RGEQKQVHFPTPFOF65L6I62FLLYWDS7`**，不是 `d/` |
-| 明文文件 | 只有 1 个：`重要.rtf`，820 B，sha256 `141d1df78e8bb95ce053bbbae0d030be7f4a4aaadda250bc938cdc659c2dc5ac` |
+| 明文文件 | 只有 1 个：`欢迎.rtf`，820 B，sha256 `141d1df78e8bb95ce053bbbae0d030be7f4a4aaadda250bc938cdc659c2dc5ac` |
 | 它的密文 | `d/SY/RGEQ…/kymd3lVEAXDmA07lgpuoDiebhu6fvHpvkCQ=.c9r`，916 B |
 | `dirid.c9r` | 96 B，**没有明文对应物**（是目录自身的标记） |
 
@@ -728,9 +728,125 @@ App 弹出：
 
 ### 11.8 下一阶段开工前要先补的一件事
 
-当前保险库太稀疏（**1 个目录、1 个文件**，即 `重要.rtf` 820 B），
+当前保险库太稀疏（**1 个目录、1 个文件**，即 `欢迎.rtf` 820 B），
 P2 要验的**中文名 / 超长名 / 多级目录 / >32 KiB 多 chunk** 一个都覆盖不到 ——
 这属于 P0-D「造一个内容更丰富的测试保险库」。**先补保险库，再写 P2**，
 否则 P2 的"与桌面版逐条对照"没有对照物。
+
+---
+
+## 12. P0-D 测试保险库 + 保险库结构实测（2026-10-08 上午）
+
+### 12.1 生成方式
+
+```bash
+bash tools/oracle/oracle.sh make /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
+bash tools/oracle/oracle.sh unlock /d/cryptomator/p0d-fixture 'p0d-fixture-passphrase-7QzmN4vT'
+```
+
+- 位于 `D:/cryptomator/p0d-fixture`，**独立密钥 + 独立口令**（口令只保护合成数据）。
+  独立是刻意的：模块若靠硬编码 `baidu` 的东西蒙对，在这里过不了。
+- 明文**确定性**（由路径派生），所以两次生成的明文完全一致、清单可 diff；
+  密钥与 vault id 随机，所以密文名每次不同 —— 这也是清单要"重新生成"而不是"入库"的原因。
+- **8 个目录、21 个文件、1,155,600 字节明文**（`recon/p0d/fixture-manifest.txt`，
+  该目录 gitignore）。
+- 覆盖：中文名、空格、隐藏文件、emoji、Windows 非法字符、仅大小写不同的同名、
+  **空文件**、1 MiB、32 KiB 边界两侧（32767 / 32768 / 32769）、超长文件名、超长目录名、
+  同名文件在不同目录。
+
+⚠️ 建库**没有**手搓 `vault.cryptomator`，而是走官方
+`CryptoFileSystemProvider.initialize(vault, props, masterkeyUri)` —— 与桌面版同一个入口。
+第一次尝试手写 masterkey + 自己 `toToken` + 自己 `mkdir` 根目录，结果是
+`ContentRootMissingException`：**内容根目录必须已存在**，`newFileSystem` 不会替你建。
+
+### 12.2 `initialize` 里藏着三个模块必须复现的事实
+
+反汇编 `CryptoFileSystemProvider.initialize` 得到（不是推测）：
+
+| 事实 | 证据 |
+|---|---|
+| **根目录的 dirId 是空字符串 `""`** | `ldc ""` → `hashDirectoryId(String)`；`new CiphertextDirectory("", contentRoot)` |
+| 根内容目录 = `d/<hashDirectoryId("")[0:2]>/<hash[0:2] 之后>` | `hashDirectoryId` 结果 `substring(0,2)` + `substring(2)` 两次 `resolve` |
+| `vault.cryptomator` 是 **HS256 JWT**，`kid` = masterkey URI | `config.toToken(masterkeyUri.toString(), masterkey.getEncoded())` |
+
+**根目录不能靠"id 命名"找**：其它目录都是 id 的函数，根目录是 `hashDirectoryId("")`，
+不调 cryptolib 算不出来。
+
+`vault.cryptomator` 解开后（现有 `baidu` 那份，直接 base64url 解 JWT）：
+
+```json
+{"kid":"masterkeyfile:masterkey.cryptomator","alg":"HS256","typ":"JWT"}
+{"jti":"b4389b25-022e-42aa-8087-bbb29b07e22b","format":8,"cipherCombo":"SIV_GCM","shorteningThreshold":220}
+```
+
+→ **P2 必须在解锁时读它**，`format/cipherCombo/shorteningThreshold` 三个参数都在里面，
+签名密钥是 `masterkey.getEncoded()`（`VaultConfig.load` 反汇编已确认）。
+别再把它当"纯 JSON" —— 纯 JSON 的是 `masterkey.cryptomator`。
+
+### 12.3 真实磁盘布局（fixture 实测）
+
+```
+d/<hash[0:2]>/<rest>/                 某目录的内容目录，hash = hashDirectoryId(dirId)
+    dirid.c9r                         该目录【自身】的 dirId，加密后
+    <b64url 名>.c9r                    一个文件
+    <b64url 名>.c9r/dir.c9r            一个【子目录】—— 名字带 .c9r 的目录，
+                                       里面的 dir.c9r 是子目录 id 的【明文】
+    <b64url 短名>.c9s/name.c9s         超长名被缩短：真名在这里
+    <b64url 短名>.c9s/contents.c9r     ……且如果它本来是文件，内容也在这里
+```
+
+两条与直觉相反的实测结论：
+
+- **dirId 是 UUID（36 字符 ASCII），不是哈希。** 实测 `dir.c9r` 内容：
+  `74d5156d-183c-44d8-a6fb-f3fa1d364c46`（`xxd` 明文可读）。
+  `hashDirectoryId` 只是把 id 映射成 `d/` 下那个 32 字符 base32 名。
+  子目录 id 在**父目录里是明文**，被加密的是**名字**。
+- **超长名会把"文件"变成"目录"**：`.c9s/` 下 `name.c9s` 存真名，
+  `contents.c9r` 存内容。只认"`.c9r` 结尾即文件"的代码会整片漏掉。
+
+旧记录里"目录布局 `d/<前2>/<余30>`（dirId 32 字符 = base32(SHA1)）"**表述不准**：
+32 字符那个是 `hashDirectoryId(dirId)` 的输出，不是 dirId 本身。
+
+### 12.4 内容文件的体积模型（5 种尺寸全部吻合）
+
+```
+磁盘字节 = 68 + 28 * ceil(明文 / 32768) + 明文
+```
+
+| 明文 | 磁盘 | 算式 |
+|---|---|---|
+| 0 | 68 | 68 |
+| 24 | 120 | 68 + 28 + 24 |
+| 32768 | 32864 | 68 + 28 + 32768 |
+| 32769 | 32893 | 68 + 56 + 32769 |
+| 1048576 | 1049540 | 68 + 896 + 1048576 |
+
+每 chunk 28 字节与"12 字节 nonce + 16 字节 GCM tag"吻合；固定的 68 字节是扣掉 chunk 之后
+剩下的部分。
+
+⚠️ **`dirid.c9r` 不遵守这个模型**：空 dirId（根目录）仍是 **96** 字节 = 68 + 28，
+即**空明文也写了一个 chunk**；而 0 字节的文件内容只有 68（一个 chunk 都没写）。
+读 `dirid.c9r` 与读文件内容不能共用同一套"长度=0 即空"的判断。
+
+**68 字节那段的内部结构尚未解开**（`xxd` 看是无特征的随机字节，文件之间不同）。
+这属于 P3，且必须靠 cryptolib 解密来解，不能靠算术猜。
+
+### 12.5 顺带修掉的两处记录错误
+
+**(a) `Unlock` 把每个文件的明文 base64 全量打进清单。** fixture 带 1 MiB 文件后，
+清单从 12 KB 涨到 1.5 MB、无法阅读。现改为**明文 ≤256 字节才内联**，否则只打 sha256
+（大文件本来就靠摘要比对）。
+
+**(b) `baidu` 保险库里那个文件叫 `欢迎.rtf`，不是 `重要.rtf`。** §11.4 与本文件 §11.8
+原先写错，已更正。区分两件事：
+
+| | 位置 | 大小 | 是不是保险库里的条目 |
+|---|---|---|---|
+| `欢迎.rtf` | 保险库内（密文 `d/SY/…/kymd3l….c9r`） | 820 B 明文 | **是**（`unlock` 解出来的真名） |
+| `重要.rtf` | `D:/cryptomator/baidu/` 根下 | 1296 B 明文 | **否**，用户手工放的普通文件 |
+
+两者大小也不同（820 vs 1296），**不是同一份文件的两个副本**。同目录下还有
+`masterkey.cryptomator.bkup` / `vault.cryptomator.bkup` —— 保险库目录里出现非保险库文件
+是正常的，**不能靠"目录里看到了什么"判断保险库内容**，只能靠 `d/` 下的密文树。
 
 

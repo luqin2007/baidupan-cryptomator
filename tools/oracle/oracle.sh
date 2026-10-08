@@ -4,6 +4,7 @@
 #
 #   oracle.sh check  <vaultDir> <passphrase>      is the passphrase right?  (no phone involved)
 #   oracle.sh unlock <vaultDir> <passphrase>      full manifest: cleartext <-> ciphertext
+#   oracle.sh make   <vaultDir> <passphrase>      build the P0-D test fixture vault (fresh keys)
 #
 # Why this exists: the module must implement Cryptomator's directory traversal itself (it cannot
 # ship cryptofs — that needs java.nio.file, guava, jackson and a local filesystem). These programs
@@ -56,9 +57,9 @@ echo "jdk  : $JAVA_HOME"
 echo "mods : $MODS"
 
 "$JAVA_HOME/bin/javac.exe" -nowarn -cp "$MODS_WIN" -d "$BUILD_WIN" \
-    "$HERE_WIN/CheckPass.java" "$HERE_WIN/Unlock.java" || exit 1
+    "$HERE_WIN/CheckPass.java" "$HERE_WIN/Unlock.java" "$HERE_WIN/MakeVault.java" || exit 1
 
-mode="${1:?usage: oracle.sh check|unlock <vaultDir> <passphrase>}"
+mode="${1:?usage: oracle.sh check|unlock|make <vaultDir> <passphrase>}"
 vault="${2:?missing vaultDir}"
 pass="${3:?missing passphrase}"
 
@@ -67,6 +68,8 @@ if [ "$mode" = "check" ]; then
         "$vault/masterkey.cryptomator" "$pass"
 elif [ "$mode" = "unlock" ]; then
     exec "$JAVA_HOME/bin/java.exe" -cp "$MODS_WIN;$BUILD_WIN" Unlock "$vault" "$pass"
+elif [ "$mode" = "make" ]; then
+    exec "$JAVA_HOME/bin/java.exe" -cp "$MODS_WIN;$BUILD_WIN" MakeVault "$vault" "$pass"
 else
     echo "unknown mode: $mode" >&2
     exit 2

@@ -39,6 +39,9 @@ import java.util.stream.Stream;
  */
 public final class Unlock {
 
+    /** Above this cleartext size the manifest prints only the digest, not the content. */
+    private static final int INLINE_LIMIT = 256;
+
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
             System.err.println("usage: Unlock <vaultDir> <passphrase>");
@@ -133,8 +136,14 @@ public final class Unlock {
                 files++;
                 byte[] b = Files.readAllBytes(p);
                 bytes += b.length;
+                // Only inline the cleartext when it is small enough to be useful in a diff. The
+                // P0-D fixture has a 1 MiB file, and inlining it turned a readable manifest into a
+                // 1.5 MB one. sha256 is the comparison that actually matters for sizeable files.
+                String payload = b.length <= INLINE_LIMIT
+                        ? " b64=" + b64(b)
+                        : " b64=<" + b.length + " bytes omitted>";
                 System.out.println("FILE  " + rel + "  <-  " + ctRel
-                        + "  size=" + b.length + " sha256=" + sha256(b) + " b64=" + b64(b));
+                        + "  size=" + b.length + " sha256=" + sha256(b) + payload);
             }
         }
         System.out.println("totals: " + dirs + " dir(s), " + files + " file(s), " + bytes + " cleartext byte(s)");
