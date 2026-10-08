@@ -816,8 +816,11 @@ public final class Hooks {
      */
     static void reconcileSoon(final String why) {
         if (reconcilePending.getAndSet(true)) {
+            // Collapsed on purpose, and not logged: one directory change fires this from every
+            // crumb it binds, and a line each would bury the pass it produced.
             return;
         }
+        Logx.i("[recon] pass queued by " + why);
         try {
             new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
                 @Override
@@ -854,12 +857,14 @@ public final class Hooks {
     private static void reconcile(String why) {
         final Context ctx = app;
         if (ctx == null) {
+            Logx.i("[recon] pass " + why + ": no application context yet");
             return;
         }
         final int idFilter = ctx.getResources().getIdentifier("filter", "id", APP_PKG);
         final int idCrumb = ctx.getResources().getIdentifier("rv_breadcrumb", "id", APP_PKG);
         java.util.List<android.view.View> copies = allCopies(idFilter);
         if (copies.isEmpty()) {
+            Logx.i("[recon] pass " + why + ": no file page in the window");
             return;
         }
 
@@ -892,16 +897,32 @@ public final class Hooks {
         if (drawn == null) {
             // Nothing readable: mid-transition, or the app is somewhere else entirely. Leaving the
             // tree alone is the safe answer — the next trigger is at most a quarter second away.
+            Logx.i("[recon] pass " + why + ": " + copies.size() + " copy/copies, none shown with a"
+                    + " readable crumb -> " + describeCopies(copies, idFilter, idCrumb));
             return;
         }
 
         String vault = vaultDirMatching(drawn);
+        if (vault == null && inOpenVault(drawn)) {
+            // The decrypted tree does not live on the vault's own page — that page holds d/, the two
+            // config files and nothing of the user's — so the button has to follow the user in, or
+            // unlocking would leave them with no way to undo it. The vault's own path is still what
+            // the button acts on, which is why the session's cloudDir is handed over rather than the
+            // page's crumb: relock() accepts it and nothing else.
+            vault = VaultUi.session().cloudDir;
+        }
         lastWantedDir = vault;
         // The rows of this page may already have been bound before the breadcrumb told us where the
         // page is, so a change of directory is what asks the list to bind them again — otherwise the
         // decrypted names would only appear once the user scrolled.
         if (VaultList.noteDrawnPath(drawn)) {
-            rebindRows(drawnCopy);
+            // The page root, not the copy the search returned: that one is the id/filter ImageView,
+            // and findViewById on a leaf finds nothing — so the rebind silently did nothing at all.
+            // It went unnoticed because the app usually binds a page's rows after drawing its
+            // breadcrumb, and the rows then read the right directory on their first pass; a page
+            // that binds its rows first (measured, arriving by a jump) kept its ciphertext names
+            // until the user scrolled.
+            rebindRows(pageRootOf(drawnCopy, idFilter, idCrumb));
         }
         if (vault != null) {
             // Restricted to the drawn page's own subtree. The window can hold two containers that
@@ -917,9 +938,45 @@ public final class Hooks {
         }
 
         // Last, so the page is dealt with exactly as before and a redirect is only ever an addition.
-        // A Cryptomator directory entry is a folder holding one dir.c9r; the files are elsewhere, and
-        // this is the moment the app has listed the one file that says where. See Nav.redirectEntry.
+        // Opening the vault directory itself leads to the decrypted tree, and a tap on a directory
+        // entry leads to that entry's contents. A Cryptomator directory is two unrelated places —
+        // an entry folder holding one dir.c9r, and the files under d/<hash> — so both of these are
+        // the same problem: the page the app opened is not the page that has the user's files.
+        Nav.redirectVaultRoot(ctx, drawn);
         Nav.redirectEntry(ctx, drawn);
+    }
+
+    /**
+     * Whether a crumb names a page of the vault that is currently unlocked.
+     *
+     * <p>Asked instead of comparing paths because the pages inside a vault are reached in one
+     * navigation each and therefore show a hash for a crumb, never the vault's own path: measured,
+     * the decrypted root draws as {@code …/content/RGEQKQVHFPTPFOF65L6I62FLLYWDS7}. A session that
+     * can name the directory the page is on is exactly the condition that matters — it is also the
+     * condition under which the rows are decryptable at all.
+     */
+    private static boolean inOpenVault(String crumb) {
+        VaultUi.Session s = VaultUi.session();
+        return s != null && crumb != null && s.dirIdOfDrawn(crumb) != null;
+    }
+
+    /**
+     * Every page copy in the window as {@code i:path/shown|hidden}, for a pass that could not
+     * name the drawn page. {@code isShown()} is included because "the new page exists but is not
+     * shown yet" and "the new page is shown but its crumb is not readable yet" look identical
+     * from the outside and have opposite fixes.
+     */
+    private static String describeCopies(java.util.List<android.view.View> copies, int idFilter,
+            int idCrumb) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < copies.size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(i).append(':').append(crumbPathOf(copies.get(i), idFilter, idCrumb))
+                    .append(copies.get(i).isShown() ? "/shown" : "/hidden");
+        }
+        return sb.toString();
     }
 
     /** The known vault directory that {@code crumb} names, or null. Longest match wins. */
@@ -1088,12 +1145,20 @@ public final class Hooks {
      * open one. Leaving it at "解锁" while the vault is already open made the button look like the
      * first click had not worked. A probe override still wins — it exists precisely to try labels
      * the module would not pick by itself.
+     *
+     * <p>Asking about the page rather than about the vault is wrong for the pages inside the vault,
+     * and measured so: the decrypted tree draws with crumbs like {@code …/content/RGEQ…}, which is
+     * not a suffix of the vault's own path and no other way round, so the button on the page the
+     * user is actually standing on read "解锁" while the vault was open. Only the vault's path is
+     * ever compared for this.
      */
     private static String buttonLabelFor(String pagePath, String override) {
         if (override != null && !override.isEmpty()) {
             return override;
         }
-        return VaultUi.isUnlockedFor(pagePath) ? BUTTON_LABEL_UNLOCKED : BUTTON_LABEL;
+        VaultUi.Session s = VaultUi.session();
+        String vault = s != null && inOpenVault(pagePath) ? s.cloudDir : pagePath;
+        return VaultUi.isUnlockedFor(vault) ? BUTTON_LABEL_UNLOCKED : BUTTON_LABEL;
     }
 
     /**
@@ -1277,7 +1342,7 @@ public final class Hooks {
             boolean mine = pageRoot == null
                     || pageRootOf(copies.get(i), idFilter, idCrumb) == pageRoot;
             if (mine && paths[i] != null
-                    && (vaultDir == null || samePath(paths[i], vaultDir))) {
+                    && (vaultDir == null || samePath(paths[i], vaultDir) || inOpenVault(paths[i]))) {
                 isTarget[i] = true;
                 wanted++;
             }

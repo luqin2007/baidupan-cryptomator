@@ -366,6 +366,54 @@ final class Nav {
     // ------------------------------------------------------- redirect -----
 
     /**
+     * Opens the decrypted tree when the user arrives at the vault directory itself.
+     *
+     * <p>The vault directory — the one holding {@code d/}, {@code masterkey.cryptomator} and
+     * {@code vault.cryptomator} — holds none of the user's files. Its entries live at
+     * {@code hashDirectoryId("")}, one level down and under a name nobody could guess, so a user
+     * who chooses to unlock and then has to walk {@code d → SY → RGEQ…} by hand has been handed the
+     * ciphertext back with extra steps.
+     *
+     * <p>No fetch is needed here, unlike {@link #redirectEntry}: the root's own directory id is the
+     * empty string, so its content path is known the moment the vault is open.
+     *
+     * <p>Guarded by the same once-per-path rule, which is what keeps the vault page usable: going
+     * back to it is how the user reaches the 还原 button, and a second jump would take that away.
+     */
+    static void redirectVaultRoot(Context ctx, String drawn) {
+        final VaultUi.Session session = VaultUi.session();
+        if (session == null || drawn == null || !Hooks.samePath(drawn, session.cloudDir)) {
+            return;
+        }
+        final String root = session.contentPathOf("");
+        if (root == null || !oncePerPath.add(drawn)) {
+            return;
+        }
+        final String target = session.cloudDir + "/" + root;
+        Logx.i("[nav] vault root opened: " + drawn + " -> " + target);
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Object frag = fileListFragment();
+                    if (frag == null) {
+                        return;
+                    }
+                    Method m = descendMethod(frag.getClass());
+                    if (m == null) {
+                        return;
+                    }
+                    invokeDescend(m, frag, fabricate(target, true));
+                    Logx.i("[nav] opened the decrypted root " + target);
+                    settleAfterRedirect("");
+                } catch (Throwable t) {
+                    Logx.w("[nav] cannot open " + target + ": " + t);
+                }
+            }
+        });
+    }
+
+    /**
      * The vault's own navigation fix: a tap on a Cryptomator directory must not stop at the entry
      * folder.
      *
@@ -497,6 +545,7 @@ final class Nav {
         entryDirIds.put(entryCloudPath, childDirId);
 
         final String target = session.cloudDir + "/" + relContent;
+        final String targetDirId = childDirId;
         Logx.i("[nav] " + drawn + " -> " + target + " (dirId " + childDirId + ", \""
                 + (realName == null ? "?" : realName) + "\")");
         new Handler(Looper.getMainLooper()).post(new Runnable() {
@@ -516,6 +565,7 @@ final class Nav {
                     }
                     invokeDescend(m, frag, file);
                     Logx.i("[nav] redirected to " + target);
+                    settleAfterRedirect(targetDirId);
                 } catch (Throwable t) {
                     Logx.w("[nav] redirect to " + target + " failed: " + t);
                 }
@@ -527,6 +577,52 @@ final class Nav {
     private static String lastSegment(String path) {
         int slash = path.lastIndexOf('/');
         return slash < 0 ? path : path.substring(slash + 1);
+    }
+
+    /**
+     * Keeps asking for a reconcile until the page being drawn is the directory just navigated to.
+     *
+     * <p>Not belt-and-braces: the pass that reads the new page can arrive <em>before</em> the new
+     * page counts as drawn, and then nothing asks again. Measured twice on the same build — the
+     * first unlock worked, the second did not — and the difference is one pass. The new page exists
+     * with a readable crumb while {@code isShown()} is still false, so {@link Hooks#reconcile} skips
+     * it, falls back to the page it replaced, and reads the directory being left; the breadcrumb
+     * fires once per directory change and has already fired, so no second pass is coming. The screen
+     * has moved and the rows keep their ciphertext names.
+     *
+     * <p>Compared by directory id rather than by path, because the two are not the same string and
+     * cannot be made so: a page reached in one navigation shows one crumb, so the decrypted root
+     * draws as {@code …/content/RGEQ…} while its content path is {@code …/d/SY/RGEQ…}. The session
+     * already knows both spellings; asking it is what makes this test correct rather than lucky.
+     *
+     * <p>Bounded, and silent once it succeeds — a redirect that never lands leaves a log line and
+     * gives up rather than polling for the life of the process.
+     */
+    private static void settleAfterRedirect(final String targetDirId) {
+        final Handler handler = new Handler(Looper.getMainLooper());
+        final int[] tries = {10};
+        final Runnable[] step = new Runnable[1];
+        step[0] = new Runnable() {
+            @Override
+            public void run() {
+                VaultUi.Session session = VaultUi.session();
+                String drawn = Hooks.drawnCrumb();
+                String dirId = session == null ? null : session.dirIdOfDrawn(drawn);
+                if (targetDirId.equals(dirId)) {
+                    Logx.i("[nav] the drawn page is the redirect target (dirId \"" + targetDirId
+                            + "\", crumb " + drawn + ")");
+                    return;
+                }
+                if (--tries[0] <= 0) {
+                    Logx.w("[nav] the redirect to dirId \"" + targetDirId + "\" never became the"
+                            + " drawn page (crumb " + drawn + ")");
+                    return;
+                }
+                Hooks.reconcileSoon("waiting for the redirect (crumb " + drawn + ")");
+                handler.postDelayed(step[0], 200);
+            }
+        };
+        handler.postDelayed(step[0], 200);
     }
 
     /** Entry folders already reported as unresolvable, so a quarter-second loop does not spam. */
