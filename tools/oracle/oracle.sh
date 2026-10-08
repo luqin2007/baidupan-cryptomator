@@ -5,6 +5,11 @@
 #   oracle.sh check  <vaultDir> <passphrase>      is the passphrase right?  (no phone involved)
 #   oracle.sh unlock <vaultDir> <passphrase>      full manifest: cleartext <-> ciphertext
 #   oracle.sh make   <vaultDir> <passphrase>      build the P0-D test fixture vault (fresh keys)
+#   oracle.sh name   <vaultDir> <passphrase> <dirId|-> enc|dec <name>...
+#                                                 ONE entry name, encrypt or decrypt. This is the
+#                                                 only mode that can speak about an entry that is not
+#                                                 in a local vault — which is exactly the situation
+#                                                 when checking a row the phone just rewrote.
 #
 # Why this exists: the module must implement Cryptomator's directory traversal itself (it cannot
 # ship cryptofs — that needs java.nio.file, guava, jackson and a local filesystem). These programs
@@ -57,9 +62,10 @@ echo "jdk  : $JAVA_HOME"
 echo "mods : $MODS"
 
 "$JAVA_HOME/bin/javac.exe" -nowarn -cp "$MODS_WIN" -d "$BUILD_WIN" \
-    "$HERE_WIN/CheckPass.java" "$HERE_WIN/Unlock.java" "$HERE_WIN/MakeVault.java" || exit 1
+    "$HERE_WIN/CheckPass.java" "$HERE_WIN/Unlock.java" "$HERE_WIN/MakeVault.java" \
+    "$HERE_WIN/NameDec.java" || exit 1
 
-mode="${1:?usage: oracle.sh check|unlock|make <vaultDir> <passphrase>}"
+mode="${1:?usage: oracle.sh check|unlock|make|name <vaultDir> <passphrase>}"
 vault="${2:?missing vaultDir}"
 pass="${3:?missing passphrase}"
 
@@ -76,6 +82,10 @@ elif [ "$mode" = "unlock" ]; then
     exec "$JAVA_HOME/bin/java.exe" "${UTF8[@]}" -cp "$MODS_WIN;$BUILD_WIN" Unlock "$vault" "$pass"
 elif [ "$mode" = "make" ]; then
     exec "$JAVA_HOME/bin/java.exe" "${UTF8[@]}" -cp "$MODS_WIN;$BUILD_WIN" MakeVault "$vault" "$pass"
+elif [ "$mode" = "name" ]; then
+    # dirId, enc|dec and the names follow the passphrase, so hand the rest over verbatim.
+    shift 3
+    exec "$JAVA_HOME/bin/java.exe" "${UTF8[@]}" -cp "$MODS_WIN;$BUILD_WIN" NameDec "$vault" "$pass" "$@"
 else
     echo "unknown mode: $mode" >&2
     exit 2
